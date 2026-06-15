@@ -237,11 +237,165 @@ class Linear::ClientTest < LinearCli::TestCase
     end
   end
 
-  test "a non-JSON, non-429 response raises ApiError noting the HTTP status" do
-    client.stub(:perform_request, ->(*) { resp(code: 502, body: "<html>bad gateway</html>") }) do
-      err = assert_raises(Linear::Client::ApiError) { client.graphql("query { x }") }
-      assert_match(/HTTP 502/, err.message)
+  test "a persistent 5xx is retried then surfaces ApiError noting the HTTP status" do
+    calls = 0
+    client.stub(:perform_request, ->(*) { calls += 1; resp(code: 502, body: "<html>bad gateway</html>") }) do
+      client.stub(:backoff_pause, ->(_s) {}) do
+        err = assert_raises(Linear::Client::ApiError) { client.graphql("query { x }") }
+        assert_match(/HTTP 502/, err.message)
+      end
     end
+    assert_equal Linear::Client::MAX_ATTEMPTS, calls, "5xx is transient — retried up to MAX_ATTEMPTS"
+  end
+
+  test "a 5xx that then recovers succeeds after backing off" do
+    queue = [resp(code: 503, body: ""), resp(code: 200, body: { "data" => { "ok" => true } }.to_json)]
+    delays = []
+    client.stub(:perform_request, ->(*) { queue.shift }) do
+      client.stub(:backoff_pause, ->(s) { delays << s }) do
+        assert_equal({ "ok" => true }, client.graphql("query { x }"))
+      end
+    end
+    assert_equal 1, delays.length, "one 5xx ⇒ one backoff before the successful retry"
+  end
+
+  test "a 200 with a non-JSON body fails fast (no retry)" do
+    calls = 0
+    client.stub(:perform_request, ->(*) { calls += 1; resp(code: 200, body: "<html>nope</html>") }) do
+      client.stub(:backoff_pause, ->(_s) { flunk "a non-JSON 200 must not back off / retry" }) do
+        err = assert_raises(Linear::Client::ApiError) { client.graphql("query { x }") }
+        assert_match(/non-JSON/, err.message)
+      end
+    end
+    assert_equal 1, calls
+  end
+
+  test "a 4xx client error (e.g. 403) fails fast — never retried" do
+    calls = 0
+    body = { "errors" => [{ "message" => "Forbidden" }] }.to_json
+    client.stub(:perform_request, ->(*) { calls += 1; resp(code: 403, body: body) }) do
+      client.stub(:backoff_pause, ->(_s) { flunk "a 4xx must not back off / retry" }) do
+        assert_raises(Linear::Client::ApiError) { client.graphql("query { x }") }
+      end
+    end
+    assert_equal 1, calls, "genuine client errors fail fast"
+  end
+
+  # --- transient network-error retry (transport layer) ----------------------
+
+  test "a transient network error is retried and then succeeds" do
+    queue = [:boom, :boom, resp(code: 200, body: { "data" => { "ok" => true } }.to_json)]
+    delays = []
+    perform = lambda do |*|
+      item = queue.shift
+      raise Net::ReadTimeout if item == :boom
+
+      item
+    end
+    client.stub(:perform_request, perform) do
+      client.stub(:backoff_pause, ->(s) { delays << s }) do
+        assert_equal({ "ok" => true }, client.graphql("query { x }"))
+      end
+    end
+    assert_equal 2, delays.length, "two transport blips ⇒ two backoffs before success"
+    assert delays.all?(&:positive?)
+  end
+
+  test "a persistent network error gives up as ApiError after MAX_ATTEMPTS" do
+    calls = 0
+    client.stub(:perform_request, ->(*) { calls += 1; raise Errno::ECONNRESET }) do
+      client.stub(:backoff_pause, ->(_s) {}) do
+        err = assert_raises(Linear::Client::ApiError) { client.graphql("query { x }") }
+        assert_match(/after #{Linear::Client::MAX_ATTEMPTS} attempt/, err.message)
+        assert_match(/ECONNRESET/, err.message)
+      end
+    end
+    assert_equal Linear::Client::MAX_ATTEMPTS, calls
+  end
+
+  # --- stale team/state map (AKA-491) ---------------------------------------
+
+  DISCREPANCY_BODY = {
+    "errors" => [{
+      "message" => "Discrepancy between issue team and state, cycle or project.",
+      "extensions" => { "code" => "INVALID_INPUT", "userError" => true }
+    }]
+  }.freeze
+
+  test "a team/state discrepancy surfaces as StaleStateError, NOT UsageLimited" do
+    client.stub(:perform_request, ->(*) { resp(code: 200, body: DISCREPANCY_BODY.to_json) }) do
+      err = assert_raises(Linear::Client::StaleStateError) { client.graphql("mutation { x }") }
+      assert_match(/Discrepancy between issue team and state/i, err.message)
+      refute_instance_of Linear::Client::UsageLimited, err
+    end
+  end
+
+  test "stale_state_error? matches the discrepancy but not a real usage cap" do
+    assert client.send(:stale_state_error?, "INVALID_INPUT",
+                       "Discrepancy between issue team and state, cycle or project.")
+    # code may be absent on some discrepancies — the message pattern is authoritative.
+    assert client.send(:stale_state_error?, "", "Discrepancy between issue team and state.")
+    refute client.send(:stale_state_error?, "USAGE_LIMIT_EXCEEDED",
+                       "You've exceeded the free issue limit for this workspace.")
+    refute client.send(:stale_state_error?, "INVALID_INPUT", "Field 'bogus' doesn't exist")
+  end
+
+  ISSUE_NODE = {
+    "id" => "i-agt52", "identifier" => "AGT-52",
+    "team" => { "id" => "t-ops", "key" => "AGT" }, "state" => { "name" => "Todo" }
+  }.freeze
+
+  test "transition re-resolves the state map and retries on a stale discrepancy, then succeeds" do
+    gql_calls = 0
+    delays = []
+    cache_busts = 0
+    success = { "issueUpdate" => { "issue" => { "identifier" => "AGT-52", "state" => { "name" => "In Progress" }, "url" => "u" } } }
+    mutation = lambda do |*_args|
+      gql_calls += 1
+      raise Linear::Client::StaleStateError, "Discrepancy between issue team and state, cycle or project." if gql_calls == 1
+
+      success
+    end
+
+    client.stub(:find_issue!, ->(_id) { ISSUE_NODE }) do
+      client.stub(:workflow_states_for, ->(_t) { STATES }) do
+        client.stub(:graphql, mutation) do
+          client.stub(:backoff_pause, ->(s) { delays << s }) do
+            client.stub(:reset_team_state_cache!, -> { cache_busts += 1 }) do
+              res = client.transition("AGT-52", :in_progress)
+              assert_equal "In Progress", res[:issue].dig("state", "name")
+            end
+          end
+        end
+      end
+    end
+
+    assert_equal 2, gql_calls, "first attempt failed stale, second succeeded"
+    assert_equal 1, cache_busts, "cache busted once before the retry"
+    assert_equal 1, delays.length
+  end
+
+  test "transition gives up as a wrapped ApiError after exhausting stale-state retries" do
+    gql_calls = 0
+    always_stale = lambda do |*_args|
+      gql_calls += 1
+      raise Linear::Client::StaleStateError, "Discrepancy between issue team and state, cycle or project."
+    end
+
+    client.stub(:find_issue!, ->(_id) { ISSUE_NODE }) do
+      client.stub(:workflow_states_for, ->(_t) { STATES }) do
+        client.stub(:graphql, always_stale) do
+          client.stub(:backoff_pause, ->(_s) {}) do
+            client.stub(:reset_team_state_cache!, -> {}) do
+              err = assert_raises(Linear::Client::ApiError) { client.transition("AGT-52", :in_progress) }
+              assert_match(/still mismatched after/i, err.message)
+            end
+          end
+        end
+      end
+    end
+
+    assert_equal Linear::Client::MAX_TRANSIENT_ATTEMPTS, gql_calls
   end
 
   test "retry_delay honors the Retry-After header over exponential backoff" do

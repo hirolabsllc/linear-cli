@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "net/http"
+require "openssl"
 require "uri"
 require "json"
 
@@ -32,6 +33,14 @@ module Linear
     # CLI prints a mode-specific hint.
     class RateLimited < ApiError; end  # HTTP 429 / extensions.code == "RATELIMITED" — retried w/ backoff, then surfaced
     class UsageLimited < ApiError; end # terminal extensions.userError == true (e.g. USAGE_LIMIT_EXCEEDED) — NEVER retried
+    # A team↔state discrepancy ("Discrepancy between issue team and state, cycle or project"). Linear
+    # returns it as an INVALID_INPUT with userError:true, so it WOULD otherwise be classified as a
+    # terminal UsageLimited — but it is the symptom of a stale/cross-team workflow-state map (a state id
+    # from the wrong team), which is RETRYABLE once the team→state map is re-resolved. {#transition}
+    # rescues this, busts the team/state caches, re-resolves, and retries; only a persistent one escapes
+    # (as a wrapped ApiError). A single transient blip must never again silently push a session onto an
+    # SSH/box-CLI fallback (AKA-491).
+    class StaleStateError < ApiError; end
 
     # Canonical Linear label colors used when auto-creating a missing label.
     LABEL_COLORS = {
@@ -53,6 +62,26 @@ module Linear
     MAX_ATTEMPTS = 4
     BASE_BACKOFF = 0.5
     MAX_BACKOFF  = 30.0
+
+    # Transient-failure retry policy for the state-map re-resolution in {#transition}. Kept separate
+    # from the rate-limit budget so a stale-state retry can't consume (or be starved by) the 429 budget.
+    # MAX_TRANSIENT_ATTEMPTS = 3 ⇒ the first try + up to 2 re-resolved retries.
+    MAX_TRANSIENT_ATTEMPTS = 3
+    TRANSIENT_BACKOFF      = 0.3
+
+    # Net::HTTP transport exceptions that mean "the round-trip itself blipped — retry it", not a real
+    # API failure. Retried at the transport layer ({#graphql}) up to MAX_ATTEMPTS, then surfaced as
+    # ApiError. A 5xx HTTP status is treated the same way.
+    NETWORK_ERRORS = [
+      Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNRESET, Errno::ECONNREFUSED,
+      Errno::EHOSTUNREACH, Errno::ENETUNREACH, Errno::ETIMEDOUT, Errno::EPIPE,
+      EOFError, SocketError, IOError, OpenSSL::SSL::SSLError
+    ].freeze
+
+    # Linear's message for a wrong-team workflow-state id (a stale/cross-team state map). Matched
+    # case-insensitively against the surfaced error so a real plan/usage cap (USAGE_LIMIT_EXCEEDED) is
+    # NOT mistaken for it — see {StaleStateError}.
+    STALE_STATE_PATTERN = /discrepancy between issue team and state/i
 
     attr_reader :team_key
 
@@ -89,7 +118,17 @@ module Linear
       attempt = 0
       loop do
         attempt += 1
-        res    = perform_request(query, variables)
+        begin
+          res = perform_request(query, variables)
+        rescue *NETWORK_ERRORS => e
+          # A transport blip (timeout / reset / SSL). Re-sending the same request is the right move —
+          # back off and retry, then surface a clear ApiError rather than crashing with a raw exception.
+          raise ApiError, "Linear request failed after #{attempt} attempt(s): #{e.class}: #{e.message}" if attempt >= MAX_ATTEMPTS
+
+          backoff_pause(exponential_backoff(attempt))
+          next
+        end
+
         status = res.code.to_i
         body   = parse_json(res.body)
         errors = body.is_a?(Hash) ? body["errors"] : nil
@@ -106,7 +145,12 @@ module Linear
             backoff_pause(retry_delay(res, attempt))
             next
           end
-          # Terminal user errors (the free-plan issue cap, etc.) are the caller's to resolve — fail fast.
+          # A team↔state discrepancy is a stale/cross-team state-map symptom, NOT a terminal plan limit
+          # — even though Linear flags it userError:true. Surface it as the distinct, retryable
+          # StaleStateError so {#transition} re-resolves + retries (and the CLI never prints the
+          # misleading "plan limit" hint that once pushed a session onto an SSH fallback — AKA-491).
+          raise StaleStateError, message if stale_state_error?(code, message)
+          # Other terminal user errors (the free-plan issue cap, etc.) are the caller's to resolve.
           raise UsageLimited, message if user_error
 
           raise ApiError, message
@@ -120,7 +164,16 @@ module Linear
           next
         end
 
+        # 5xx is a transient server-side blip — retry the round-trip before giving up.
+        if status >= 500
+          raise ApiError, "Linear returned HTTP #{status} after #{attempt} attempt(s): #{truncate(res.body)}" if attempt >= MAX_ATTEMPTS
+
+          backoff_pause(exponential_backoff(attempt))
+          next
+        end
+
         raise ApiError, "Linear returned a non-JSON response (HTTP #{status}): #{truncate(res.body)}" unless body.is_a?(Hash)
+        # Remaining 4xx (400/401/403/404/422 …) are genuine client errors — fail fast, never retry.
         raise ApiError, "Linear returned HTTP #{status}: #{truncate(res.body)}" if status >= 400
 
         return body["data"]
@@ -350,23 +403,43 @@ module Linear
     # Move an issue to a lifecycle state (:todo/:in_progress/:in_review/:done/:canceled), optionally
     # posting a comment in the same call. Returns { issue:, from: }.
     def transition(identifier, target, comment: nil)
-      issue = find_issue!(identifier)
-      # Resolve the target state from the ISSUE's OWN team, not the client default — so closing an
-      # issue targets its own team's "Done" (cross-team state ids don't apply).
-      issue_team_id  = issue.dig("team", "id")
-      issue_team_key = issue.dig("team", "key") || team_key
-      states = issue_team_id ? workflow_states_for(issue_team_id) : workflow_states
-      state  = find_state(target, states: states, team_label: issue_team_key)
-      data = graphql(<<~GQL, { id: issue["id"], stateId: state["id"] })
-        mutation($id: String!, $stateId: String!) {
-          issueUpdate(id: $id, input: { stateId: $stateId }) {
-            success
-            issue { identifier title state { name } url }
+      attempt = 0
+      begin
+        attempt += 1
+        # Re-fetch the issue each attempt: a transient partial response can return it without a `team`
+        # node, which would otherwise fall back to the DEFAULT team's states (the cross-team state-map
+        # bug behind AKA-491). A fresh fetch on retry repopulates the team.
+        issue = find_issue!(identifier)
+        # Resolve the target state from the ISSUE's OWN team, not the client default — so closing an
+        # issue targets its own team's "Done" (cross-team state ids don't apply).
+        issue_team_id  = issue.dig("team", "id")
+        issue_team_key = issue.dig("team", "key") || team_key
+        states = issue_team_id ? workflow_states_for(issue_team_id) : workflow_states
+        state  = find_state(target, states: states, team_label: issue_team_key)
+        debug_log { "transition #{identifier} → #{target}: team=#{issue_team_key}(#{issue_team_id}) state=#{state['name']}(#{state['id']}) attempt=#{attempt}" }
+        data = graphql(<<~GQL, { id: issue["id"], stateId: state["id"] })
+          mutation($id: String!, $stateId: String!) {
+            issueUpdate(id: $id, input: { stateId: $stateId }) {
+              success
+              issue { identifier title state { name } url }
+            }
           }
-        }
-      GQL
-      add_comment(issue["id"], comment) if comment && !comment.to_s.empty?
-      { issue: data.dig("issueUpdate", "issue"), from: issue.dig("state", "name") }
+        GQL
+        add_comment(issue["id"], comment) if comment && !comment.to_s.empty?
+        { issue: data.dig("issueUpdate", "issue"), from: issue.dig("state", "name") }
+      rescue StaleStateError => e
+        # A wrong-team state id slipped through (stale/partial team↔state resolution). Bust the team +
+        # workflow-state caches and re-resolve from scratch, then retry. Only a persistent discrepancy
+        # escapes — wrapped as a clear ApiError so it still fails (loudly), never silently.
+        if attempt >= MAX_TRANSIENT_ATTEMPTS
+          raise ApiError, "Linear team/state map still mismatched after #{attempt} re-resolved attempt(s): #{e.message}"
+        end
+
+        reset_team_state_cache!
+        debug_log { "transition #{identifier}: stale team/state map (#{e.message}) — re-resolving, retry #{attempt + 1}/#{MAX_TRANSIENT_ATTEMPTS}" }
+        backoff_pause(TRANSIENT_BACKOFF * attempt)
+        retry
+      end
     end
 
     # Move a Done/Canceled (or any) issue back to Todo (default) or In Progress — a recurrence of
@@ -578,6 +651,43 @@ module Linear
     # A 429 status or an explicit RATELIMITED GraphQL code means "retry after backing off".
     def rate_limited?(status, code)
       status == 429 || code.to_s.casecmp?("RATELIMITED")
+    end
+
+    # A team↔state discrepancy (INVALID_INPUT whose message names the team/state mismatch). Retryable
+    # by re-resolving the state map — distinguished from a real plan/usage cap, which never matches the
+    # pattern. The code check is best-effort (some discrepancies omit it), so the message pattern is
+    # authoritative.
+    def stale_state_error?(code, message)
+      return false if message.to_s.empty?
+      return false unless STALE_STATE_PATTERN.match?(message.to_s)
+
+      code.to_s.empty? || code.casecmp?("INVALID_INPUT")
+    end
+
+    # Drop the per-instance team / workflow-state memoization so the next resolve re-queries Linear.
+    # Used by {#transition} when a stale state map produced a wrong-team state id.
+    def reset_team_state_cache!
+      @teams = nil
+      @team_id = nil
+      @workflow_states_by_team = nil
+    end
+
+    # Plain exponential backoff (no rate-limit headers in play) clamped to MAX_BACKOFF — used for the
+    # network/5xx transport retries.
+    def exponential_backoff(attempt)
+      clamp_delay(BASE_BACKOFF * (2**(attempt - 1)))
+    end
+
+    # Opt-in diagnostic, off unless LINEAR_DEBUG is set — logs the resolved team + state id and any
+    # self-healing retry so a future discrepancy is debuggable without re-instrumenting. The block form
+    # avoids building the string when disabled. Goes to $stderr (the CLI's diagnostic stream); never
+    # stdout, so it can't pollute machine-readable output.
+    def debug_log
+      return unless ENV["LINEAR_DEBUG"] && !ENV["LINEAR_DEBUG"].to_s.strip.empty?
+
+      warn "[linear] #{yield}"
+    rescue StandardError
+      nil
     end
 
     # The error to base the surfaced message on: the first one carrying an extensions.code (Linear puts
