@@ -6,7 +6,7 @@ require "test_helper"
 # priority mapping, lifecycle-state resolution (workflow_states stubbed), input validation, and the
 # missing-API-key guard. The GraphQL operation bodies are exercised end-to-end through the CLI
 # (exe/linear) and a host app's controller injects a fake, so here we pin the pure decision logic.
-class Linear::ClientTest < HglLinear::TestCase
+class Linear::ClientTest < LinearCli::TestCase
   STATES = [
     { "id" => "s-backlog", "name" => "Backlog",     "type" => "backlog" },
     { "id" => "s-todo",    "name" => "Todo",        "type" => "unstarted" },
@@ -42,9 +42,16 @@ class Linear::ClientTest < HglLinear::TestCase
     refute Linear::Client.new(api_key: "   ").configured?
   end
 
-  test "team_key defaults to AKA and is overridable" do
-    assert_equal "AKA", Linear::Client.new.team_key
+  test "team_key comes from LINEAR_DEFAULT_TEAM, is overridable, and has no hardcoded default" do
     assert_equal "ENG", Linear::Client.new(team_key: "ENG").team_key
+    # Blank/whitespace team keys normalize to nil (no hardcoded fallback team).
+    assert_nil Linear::Client.new(team_key: nil).team_key
+    assert_nil Linear::Client.new(team_key: "   ").team_key
+  end
+
+  test "team_id_for raises a clear ConfigError when no team is configured" do
+    err = assert_raises(Linear::Client::ConfigError) { client.team_id_for(nil) }
+    assert_match(/LINEAR_DEFAULT_TEAM/, err.message)
   end
 
   test "graphql raises ConfigError when the key is missing (no network)" do
@@ -76,16 +83,16 @@ class Linear::ClientTest < HglLinear::TestCase
     end
   end
 
-  # --- multi-team resolution (AKA-456) -------------------------------------
+  # --- multi-team resolution ------------------------------------------------
   TEAMS = [
-    { "id" => "t-aka", "key" => "AKA" },
-    { "id" => "t-agt", "key" => "AGT" }
+    { "id" => "t-eng", "key" => "ENG" },
+    { "id" => "t-ops", "key" => "OPS" }
   ].freeze
 
   test "team_id_for resolves a team by key and raises for an unknown one (no network beyond teams)" do
     client.stub(:teams, TEAMS) do
-      assert_equal "t-aka", client.team_id_for("AKA")
-      assert_equal "t-agt", client.team_id_for("AGT")
+      assert_equal "t-eng", client.team_id_for("ENG")
+      assert_equal "t-ops", client.team_id_for("OPS")
       err = assert_raises(Linear::Client::ApiError) { client.team_id_for("NOPE") }
       assert_match(/Team NOPE not found/, err.message)
     end
@@ -93,31 +100,31 @@ class Linear::ClientTest < HglLinear::TestCase
 
   test "find_state uses an explicitly-passed per-team states list (not the default team's)" do
     # No workflow_states stub here — find_state must read the states it is GIVEN, so a close on an
-    # AGT issue resolves AGT's states, never the client default's.
+    # issue resolves that issue's team's states, never the client default's.
     assert_equal "s-done", client.send(:find_state, :done, states: STATES)["id"]
     assert_equal "s-prog", client.send(:find_state, :in_progress, states: STATES)["id"]
   end
 
   test "find_state names the issue's own team in the 'state not found' error" do
     err = assert_raises(Linear::Client::InvalidInput) do
-      client.send(:find_state, :done, states: [], team_label: "AGT")
+      client.send(:find_state, :done, states: [], team_label: "OPS")
     end
-    assert_match(/in the AGT workflow/, err.message)
+    assert_match(/in the OPS workflow/, err.message)
   end
 
   test "relate rejects an unknown relation type before any network call" do
     err = assert_raises(Linear::Client::InvalidInput) do
-      client.relate("AKA-1", "AKA-2", type: "bogus")
+      client.relate("ENG-1", "ENG-2", type: "bogus")
     end
     assert_match(/Unknown relation type/, err.message)
   end
 
   test "add_labels rejects an empty label list before any network call" do
-    assert_raises(Linear::Client::InvalidInput) { client.add_labels("AKA-1", []) }
-    assert_raises(Linear::Client::InvalidInput) { client.add_labels("AKA-1", ["  "]) }
+    assert_raises(Linear::Client::InvalidInput) { client.add_labels("ENG-1", []) }
+    assert_raises(Linear::Client::InvalidInput) { client.add_labels("ENG-1", ["  "]) }
   end
 
-  # --- error surfacing + rate-limit backoff (AKA-283) ----------------------
+  # --- error surfacing + rate-limit backoff ---------------------------------
   # Minimal stand-in for Net::HTTPResponse: #code (String), #body (String), case-insensitive #[].
   FakeResponse = Struct.new(:code, :body, :headers) do
     def [](key) = (headers || {}).transform_keys(&:downcase)[key.to_s.downcase]

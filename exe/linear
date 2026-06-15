@@ -1,21 +1,21 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# linear — Linear issue management CLI (ships in the hgl_linear gem).
+# linear — Linear issue management CLI (ships in the linear_cli gem).
 #
 # A THIN CLI over Linear::Client (the gem library). All Linear GraphQL + lifecycle conventions live in
 # Linear::Client; this layer only parses args, prints stdout, and handles local files (git/images).
 #
-# Multi-team: the workspace may have several teams (AKA / AGT / ORC / …). create/list default to
-# $LINEAR_DEFAULT_TEAM (override with --team KEY); every other command takes an issue id (AKA-N,
-# AGT-N, …) and resolves its team automatically — no --team needed. Config is env-only:
+# Multi-team: the workspace may have several teams. create/list default to $LINEAR_DEFAULT_TEAM
+# (override with --team KEY); every other command takes an issue id (e.g. ENG-123) and resolves its
+# team automatically — no --team needed. Config is env-only:
 #   LINEAR_API_KEY       (required)  — get one at linear.app/settings/api
-#   LINEAR_DEFAULT_TEAM  (optional)  — default team key for create/list (e.g. AGT, ORC, AKA)
+#   LINEAR_DEFAULT_TEAM  (optional)  — default team key for create/list (e.g. ENG)
 #
 # Usage examples:
 #   linear search "<keywords>" [--limit N]
 #   linear create "Title" [--team KEY] [--label Bug|Feature|...] [--priority urgent|high|medium|low] [--desc "body"] ...
-#   linear start AKA-N --session "..."   |   linear review AKA-N --sha <sha>   |   linear close AKA-N
+#   linear start ISSUE-N --session "..."   |   linear review ISSUE-N --sha <sha>   |   linear close ISSUE-N
 
 require "net/http"
 require "uri"
@@ -23,7 +23,7 @@ require "json"
 
 # Soft-load a .env from the working directory when dotenv is available, so `linear` "just works" in a
 # project checkout that keeps its key in .env. Falls back to the real environment otherwise (the
-# canonical config path on servers / the agent-ops box). Never fatal if dotenv isn't installed.
+# canonical config path on servers). Never fatal if dotenv isn't installed.
 begin
   require "dotenv"
   Dotenv.load(".env") if File.exist?(".env")
@@ -31,25 +31,26 @@ rescue LoadError
   # dotenv not present — read LINEAR_API_KEY / LINEAR_DEFAULT_TEAM straight from ENV.
 end
 
-require "hgl_linear"
+require "linear_cli"
 
 # This program's invoked name (`linear`, or `bin/linear` via a host shim) — used in usage strings.
 PROG = File.basename($PROGRAM_NAME)
 
-# Re-tag command-line args as UTF-8. In this environment Encoding.default_external is US-ASCII, so
-# Ruby tags ARGV bytes as US-ASCII/ASCII-8BIT — a title/desc/note/comment containing a non-ASCII char
-# (an em-dash, an arrow like ⇄, an accent — all routine in this repo) then crashes the moment it is
-# `.strip`ed or joined with the UTF-8 markdown we build (Encoding::CompatibilityError). The shell
-# hands us UTF-8 bytes, so re-tagging is correct; `.scrub` keeps even malformed bytes non-fatal. (AKA-218)
+# Re-tag command-line args as UTF-8. When Encoding.default_external is US-ASCII, Ruby tags ARGV bytes
+# as US-ASCII/ASCII-8BIT — a title/desc/note/comment containing a non-ASCII char (an em-dash, an arrow
+# like ⇄, an accent) then crashes the moment it is `.strip`ed or joined with the UTF-8 markdown we
+# build (Encoding::CompatibilityError). The shell hands us UTF-8 bytes, so re-tagging is correct;
+# `.scrub` keeps even malformed bytes non-fatal.
 ARGV.map! { |a| a.dup.force_encoding("UTF-8").scrub }
 
 # One shared client for the whole invocation (reads LINEAR_API_KEY from ENV; memoizes teams/states).
-# The workspace is multi-team (AKA / AGT / ORC / …); the client resolves any team by key.
+# The workspace may be multi-team; the client resolves any team by key.
 CLIENT = Linear::Client.new
 
-# Default team for `create`/`list` when no --team is given: $LINEAR_DEFAULT_TEAM if set, else nil so
-# the client falls back to its own default (AKA). A per-command --team always wins. Identifier-based
-# commands (view/close/comment/start/review/label/…) need no team — they resolve it from the issue id.
+# Default team for `create`/`list` when no --team is given: $LINEAR_DEFAULT_TEAM if set, else nil — a
+# team must then come from --team or the command errors. A per-command --team always wins.
+# Identifier-based commands (view/close/comment/start/review/label/…) need no team — they resolve it
+# from the issue id.
 def default_team
   t = ENV["LINEAR_DEFAULT_TEAM"].to_s.strip
   t.empty? ? nil : t
@@ -65,10 +66,10 @@ end
 # local-git concern, so it stays in the CLI; the resulting markdown is posted via CLIENT.comment.
 
 # Run a git command and return its stdout as a UTF-8 string. Ruby tags backtick output with
-# Encoding.default_external, which is US-ASCII in this environment — so a commit subject carrying a
-# non-ASCII char (e.g. the ⇄ in AKA-207's subject) made the very first `.strip` raise
-# Encoding::CompatibilityError, crashing `linear commit` (AKA-218). git emits UTF-8, so re-tag the
-# bytes as UTF-8 before any string op; `.scrub` makes even genuinely malformed bytes non-fatal.
+# Encoding.default_external; when that is US-ASCII, a commit subject carrying a non-ASCII char (e.g. a
+# ⇄) makes the very first `.strip` raise Encoding::CompatibilityError, crashing `linear commit`. git
+# emits UTF-8, so re-tag the bytes as UTF-8 before any string op; `.scrub` makes even genuinely
+# malformed bytes non-fatal.
 def git_capture(cmd)
   `#{cmd}`.force_encoding("UTF-8").scrub
 end
@@ -187,12 +188,12 @@ def format_issue_links(issue)
 end
 
 def cmd_create(args)
-  title = args.shift or abort "Usage: #{PROG} create \"Title\" [--team KEY] [--label X] [--priority X] [--desc \"body\"] [--image PATH ...] [--parent AKA-N] [--blocked-by AKA-N] [--blocks AKA-N] [--related AKA-N]"
+  title = args.shift or abort "Usage: #{PROG} create \"Title\" [--team KEY] [--label X] [--priority X] [--desc \"body\"] [--image PATH ...] [--parent ISSUE-N] [--blocked-by ISSUE-N] [--blocks ISSUE-N] [--related ISSUE-N]"
   label_name, priority_name, description = nil, "medium", nil
   images = []
   parent_ref = nil
   blocks_refs, blocked_by_refs, related_refs = [], [], []
-  team_key = default_team   # --team KEY > $LINEAR_DEFAULT_TEAM > AKA (the client's fallback)
+  team_key = default_team   # --team KEY > $LINEAR_DEFAULT_TEAM (no hardcoded fallback)
 
   i = 0
   while i < args.length
@@ -237,7 +238,7 @@ def cmd_create(args)
 end
 
 def cmd_view(args)
-  identifier = args.shift or abort "Usage: #{PROG} view AKA-N"
+  identifier = args.shift or abort "Usage: #{PROG} view ISSUE-N"
   issue = CLIENT.find_issue(identifier)
   abort "Issue #{identifier} not found" unless issue
 
@@ -257,14 +258,14 @@ def cmd_view(args)
 end
 
 def cmd_url(args)
-  identifier = args.shift or abort "Usage: #{PROG} url AKA-N"
+  identifier = args.shift or abort "Usage: #{PROG} url ISSUE-N"
   issue = CLIENT.find_issue(identifier) or abort "Issue #{identifier} not found"
   puts issue["url"]
 end
 
 def cmd_retitle(args)
-  identifier = args.shift or abort "Usage: #{PROG} retitle AKA-N \"New title\""
-  new_title  = args.shift or abort "Usage: #{PROG} retitle AKA-N \"New title\""
+  identifier = args.shift or abort "Usage: #{PROG} retitle ISSUE-N \"New title\""
+  new_title  = args.shift or abort "Usage: #{PROG} retitle ISSUE-N \"New title\""
   res = CLIENT.retitle(identifier, new_title)
   updated = res[:issue]
   puts "#{updated["identifier"]}: \"#{res[:old_title]}\" → \"#{updated["title"]}\""
@@ -272,7 +273,7 @@ def cmd_retitle(args)
 end
 
 def cmd_close(args)
-  identifier = args.shift or abort "Usage: #{PROG} close AKA-N [--comment \"reason\"]"
+  identifier = args.shift or abort "Usage: #{PROG} close ISSUE-N [--comment \"reason\"]"
   comment = nil
   i = 0
   while i < args.length
@@ -318,8 +319,8 @@ def cmd_list(args)
 end
 
 def cmd_comment(args)
-  identifier = args.shift or abort "Usage: #{PROG} comment AKA-N \"body\" [--image PATH ...]"
-  body = args.shift or abort "Usage: #{PROG} comment AKA-N \"body\" [--image PATH ...]"
+  identifier = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" [--image PATH ...]"
+  body = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" [--image PATH ...]"
   images = []
   i = 0
   while i < args.length
@@ -334,9 +335,9 @@ def cmd_comment(args)
 end
 
 # Attach screenshots (repro / QA evidence) to an issue as a comment with inline images.
-# Positional args after AKA-N are image paths; --note adds a caption above them.
+# Positional args after ISSUE-N are image paths; --note adds a caption above them.
 def cmd_attach(args)
-  identifier = args.shift or abort "Usage: #{PROG} attach AKA-N PATH [PATH ...] [--note \"caption\"]"
+  identifier = args.shift or abort "Usage: #{PROG} attach ISSUE-N PATH [PATH ...] [--note \"caption\"]"
   note  = nil
   paths = []
   i = 0
@@ -346,14 +347,14 @@ def cmd_attach(args)
     else paths << args[i]; i += 1
     end
   end
-  abort "Usage: #{PROG} attach AKA-N PATH [PATH ...] [--note \"caption\"]" if paths.empty?
+  abort "Usage: #{PROG} attach ISSUE-N PATH [PATH ...] [--note \"caption\"]" if paths.empty?
   body = join_md(note, images_markdown(paths))
   CLIENT.comment(identifier, body)
   puts "Attached #{paths.length} image(s) to #{identifier}."
 end
 
 def cmd_start(args)
-  identifier = args.shift or abort "Usage: #{PROG} start AKA-N [--session \"name\"]"
+  identifier = args.shift or abort "Usage: #{PROG} start ISSUE-N [--session \"name\"]"
   session_name = nil
   i = 0
   while i < args.length
@@ -370,7 +371,7 @@ def cmd_start(args)
 end
 
 def cmd_review(args)
-  identifier = args.shift or abort "Usage: #{PROG} review AKA-N [--sha <sha>]"
+  identifier = args.shift or abort "Usage: #{PROG} review ISSUE-N [--sha <sha>]"
   sha = nil
   i = 0
   while i < args.length
@@ -390,7 +391,7 @@ end
 # run it after every `git commit` tied to the issue so the ticket carries a linked trail of each
 # commit (not just the final merge SHA). Does NOT change state. --note adds a caption line above.
 def cmd_commit(args)
-  identifier = args.shift or abort "Usage: #{PROG} commit AKA-N [--sha <ref>] [--note \"context\"]"
+  identifier = args.shift or abort "Usage: #{PROG} commit ISSUE-N [--sha <ref>] [--note \"context\"]"
   ref  = "HEAD"
   note = nil
   i = 0
@@ -409,14 +410,14 @@ def cmd_commit(args)
 end
 
 def cmd_label(args)
-  identifier = args.shift or abort "Usage: #{PROG} label AKA-N <label>"
-  label_name = args.shift or abort "Usage: #{PROG} label AKA-N <label>"
+  identifier = args.shift or abort "Usage: #{PROG} label ISSUE-N <label>"
+  label_name = args.shift or abort "Usage: #{PROG} label ISSUE-N <label>"
   CLIENT.add_labels(identifier, [label_name])
   puts "#{identifier}: label '#{label_name}' applied."
 end
 
 def cmd_cancel(args)
-  identifier = args.shift or abort "Usage: #{PROG} cancel AKA-N [--comment \"reason\"]"
+  identifier = args.shift or abort "Usage: #{PROG} cancel ISSUE-N [--comment \"reason\"]"
   comment = nil
   i = 0
   while i < args.length
@@ -471,7 +472,7 @@ end
 # work. Keeps the original repro, history, and merged-SHA trail. Defaults to Todo; --in-progress
 # reopens straight to active.
 def cmd_reopen(args)
-  identifier = args.shift or abort "Usage: #{PROG} reopen AKA-N [--in-progress] [--comment \"why it recurred\"]"
+  identifier = args.shift or abort "Usage: #{PROG} reopen ISSUE-N [--in-progress] [--comment \"why it recurred\"]"
   to_progress = false
   comment     = nil
   i = 0
@@ -490,11 +491,11 @@ def cmd_reopen(args)
 end
 
 # Create a real Linear relation between two issues (shows in the UI, unlike a text "duplicate of
-# AKA-X" comment). --type related (default), blocks, blocked-by, duplicate, or similar. For an
+# ISSUE-X" comment). --type related (default), blocks, blocked-by, duplicate, or similar. For an
 # epic→sub-ticket breakdown use the `parent` command instead.
 def cmd_relate(args)
-  a = args.shift or abort "Usage: #{PROG} relate AKA-N AKA-M [--type related|blocks|blocked-by|duplicate|similar]"
-  b = args.shift or abort "Usage: #{PROG} relate AKA-N AKA-M [--type related|blocks|blocked-by|duplicate|similar]"
+  a = args.shift or abort "Usage: #{PROG} relate ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]"
+  b = args.shift or abort "Usage: #{PROG} relate ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]"
   type = "related"
   i = 0
   while i < args.length
@@ -518,12 +519,12 @@ def cmd_relate(args)
   end
 end
 
-# Make AKA-CHILD a sub-issue of AKA-PARENT — Linear's native epic hierarchy, the right model for an
+# Make CHILD a sub-issue of PARENT — Linear's native epic hierarchy, the right model for an
 # epic broken into numbered sub-tickets (e.g. "Radar 1/6..6/6"). Unlike `relate`, this shows as a
 # real parent/sub-issue with progress rollup.
 def cmd_parent(args)
-  child  = args.shift or abort "Usage: #{PROG} parent AKA-CHILD AKA-PARENT"
-  parent = args.shift or abort "Usage: #{PROG} parent AKA-CHILD AKA-PARENT"
+  child  = args.shift or abort "Usage: #{PROG} parent CHILD PARENT"
+  parent = args.shift or abort "Usage: #{PROG} parent CHILD PARENT"
   CLIENT.set_parent_by_identifier(child, parent)
   puts "#{child} is now a sub-issue of #{parent}."
 end
@@ -531,8 +532,8 @@ end
 # Remove any relation(s) between two issues (the inverse of `relate`) — e.g. to clean up a link
 # created in error. Deletes in both directions if present.
 def cmd_unrelate(args)
-  a = args.shift or abort "Usage: #{PROG} unrelate AKA-N AKA-M"
-  b = args.shift or abort "Usage: #{PROG} unrelate AKA-N AKA-M"
+  a = args.shift or abort "Usage: #{PROG} unrelate ISSUE-N ISSUE-M"
+  b = args.shift or abort "Usage: #{PROG} unrelate ISSUE-N ISSUE-M"
   count = CLIENT.unrelate(a, b)
   abort "No relation between #{a} and #{b}." if count.zero?
 
@@ -562,44 +563,44 @@ begin
   when "label"   then cmd_label(ARGV)
   else
     puts <<~USAGE
-      #{PROG} — Linear issue CLI (hgl_linear gem; default team #{default_team || Linear::Client::DEFAULT_TEAM_KEY})
+      #{PROG} — Linear issue CLI (linear_cli gem; default team #{default_team || "(set $LINEAR_DEFAULT_TEAM or use --team)"})
 
-      Multi-team: the workspace has several teams (AKA / AGT / ORC / …). create/list default to
-      #{default_team || Linear::Client::DEFAULT_TEAM_KEY} (override with --team KEY, or set $LINEAR_DEFAULT_TEAM). Every other command takes an
-      issue id (AKA-N, AGT-N, …) and resolves its team automatically — no --team needed.
+      Multi-team: the workspace may have several teams. create/list default to
+      #{default_team || "$LINEAR_DEFAULT_TEAM"} (override with --team KEY, or set $LINEAR_DEFAULT_TEAM). Every other command takes an
+      issue id (e.g. ENG-123) and resolves its team automatically — no --team needed.
 
       Commands:
         create  "Title" [--team KEY] [--label Bug|Feature|Infrastructure|Ops] [--priority urgent|high|medium|low] [--desc "body"] [--image PATH ...]
-                [--parent AKA-N] [--blocked-by AKA-N] [--blocks AKA-N] [--related AKA-N]   ← link deps AT create time
+                [--parent ISSUE-N] [--blocked-by ISSUE-N] [--blocks ISSUE-N] [--related ISSUE-N]   ← link deps AT create time
         search  "<keywords>" [--limit N]             full-text dedup search (ALL states; run BEFORE create)
         list    [--status todo|in_progress|done] [--label Bug] [--team KEY]
-        view    AKA-N                                shows parent/sub-issues/relations under "Links:"
-        url     AKA-N
-        retitle AKA-N "New title"                     change an issue's title (alias: rename); prints old → new
-        reopen  AKA-N [--in-progress] [--comment "why"]   move a Done/Canceled issue back (recurrence)
-        parent  AKA-CHILD AKA-PARENT                  make CHILD a sub-issue of an epic (native hierarchy + rollup)
-        relate  AKA-N AKA-M [--type related|blocks|blocked-by|duplicate|similar]   link two issues (real Linear relation)
-        unrelate AKA-N AKA-M                          remove the relation(s) between two issues (inverse of relate)
-        start   AKA-N [--session "session name"]     move to In Progress + log session attribution
-        review  AKA-N [--sha <sha>]                  move to In Review + log merged SHA as a GitHub link
-        commit  AKA-N [--sha <ref>] [--note "..."]   link a commit (clickable GitHub link + subject; default HEAD)
-        comment AKA-N "body" [--image PATH ...]      add a comment (QA result, notes, etc.)
-        attach  AKA-N PATH [PATH ...] [--note "..."]  attach screenshot(s) — repro/QA evidence
-        label   AKA-N <label>                         add a label (auto-creates it if missing)
-        close   AKA-N [--comment "reason"]           mark Done (verified on prod)
-        cancel  AKA-N [--comment "reason"]           mark Canceled (duplicates / won't-do)
+        view    ISSUE-N                                shows parent/sub-issues/relations under "Links:"
+        url     ISSUE-N
+        retitle ISSUE-N "New title"                     change an issue's title (alias: rename); prints old → new
+        reopen  ISSUE-N [--in-progress] [--comment "why"]   move a Done/Canceled issue back (recurrence)
+        parent  CHILD PARENT                  make CHILD a sub-issue of an epic (native hierarchy + rollup)
+        relate  ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]   link two issues (real Linear relation)
+        unrelate ISSUE-N ISSUE-M                          remove the relation(s) between two issues (inverse of relate)
+        start   ISSUE-N [--session "session name"]     move to In Progress + log session attribution
+        review  ISSUE-N [--sha <sha>]                  move to In Review + log merged SHA as a GitHub link
+        commit  ISSUE-N [--sha <ref>] [--note "..."]   link a commit (clickable GitHub link + subject; default HEAD)
+        comment ISSUE-N "body" [--image PATH ...]      add a comment (QA result, notes, etc.)
+        attach  ISSUE-N PATH [PATH ...] [--note "..."]  attach screenshot(s) — repro/QA evidence
+        label   ISSUE-N <label>                         add a label (auto-creates it if missing)
+        close   ISSUE-N [--comment "reason"]           mark Done (verified on prod)
+        cancel  ISSUE-N [--comment "reason"]           mark Canceled (duplicates / won't-do)
 
       Labels auto-create on first use, so --label Bug works even before the label exists.
 
       Dependencies (link them AT create time so they're never forgotten):
-        --parent AKA-N      sub-issue of an epic (epic breakdown — use this for "X 1/6..6/6")
-        --blocked-by AKA-N  this ticket depends on AKA-N (can't ship until AKA-N does)
-        --blocks AKA-N      this ticket must ship before AKA-N
-        --related AKA-N     sibling / same-root-cause follow-up (no hard ordering)
+        --parent ISSUE-N      sub-issue of an epic (epic breakdown — use this for "X 1/6..6/6")
+        --blocked-by ISSUE-N  this ticket depends on ISSUE-N (can't ship until ISSUE-N does)
+        --blocks ISSUE-N      this ticket must ship before ISSUE-N
+        --related ISSUE-N     sibling / same-root-cause follow-up (no hard ordering)
 
       Lifecycle:
         search (dedup) → create [+link deps] → start (picked up) → commit (after each commit) → review --sha (merged to main) → comment (QA) → close (prod verified)
-        └─ link every commit tied to the issue with `commit AKA-N` so the ticket carries a clickable GitHub trail.
+        └─ link every commit tied to the issue with `commit ISSUE-N` so the ticket carries a clickable GitHub trail.
         └─ on a match: `reopen` a Done/Canceled one, or `relate`/`cancel --type duplicate` instead of creating a dup.
 
       Config is env-only: LINEAR_API_KEY (required) + LINEAR_DEFAULT_TEAM (default create/list team).

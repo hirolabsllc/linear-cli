@@ -1,20 +1,20 @@
 # frozen_string_literal: true
 
-require_relative "lib/hgl_linear/version"
+require_relative "lib/linear_cli/version"
 
 Gem::Specification.new do |spec|
-  spec.name     = "hgl_linear"
-  spec.version  = HglLinear::VERSION
+  spec.name     = "linear_cli"
+  spec.version  = LinearCli::VERSION
   spec.authors  = ["Hiro Labs"]
   spec.email    = ["tyler@hirolabs.com"]
 
   spec.summary  = "Standalone Linear ticketing library + CLI (Linear::Client + the `linear` command)."
   spec.description = <<~DESC
-    hgl_linear is a project-agnostic Linear ticketing tool. It ships BOTH the reusable Linear::Client
+    linear_cli is a project-agnostic Linear ticketing tool. It ships BOTH the reusable Linear::Client
     library (the single place all Linear GraphQL + lifecycle conventions live — multi-team, dedup
     search, relations, state transitions, rate-limit backoff) AND a `linear` CLI built on it. Config
-    is env-only (LINEAR_API_KEY + LINEAR_DEFAULT_TEAM), so any project — trader-ai, the agent-ops
-    Hermes bot, Orcaru — drives the same tool with zero app coupling.
+    is env-only (LINEAR_API_KEY + LINEAR_DEFAULT_TEAM), so any project drives the same tool against
+    the same Linear workspace with zero app coupling.
   DESC
 
   spec.homepage = "https://github.com/hirolabsllc/linear-cli"

@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# Standalone test harness for the hgl_linear gem — no Rails / ActiveSupport.
+# Standalone test harness for the linear_cli gem — no Rails / ActiveSupport.
 #
 # Provides just enough to run the lifted Linear::Client tests verbatim:
 #   * Minitest as the runner, plus `minitest/mock` for the `.stub` helper the tests use.
@@ -8,9 +8,9 @@
 #     were written in) implemented on a plain Minitest::Test subclass.
 require "minitest/autorun"
 require "minitest/mock"
-require "hgl_linear"
+require "linear_cli"
 
-module HglLinear
+module LinearCli
   # Base test case: plain Minitest plus the `test "..." do` declarative syntax.
   class TestCase < Minitest::Test
     # Define a test from a description string, mirroring ActiveSupport::TestCase#test. The body

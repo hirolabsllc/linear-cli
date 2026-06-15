@@ -2,9 +2,8 @@
 
 ## [1.0.0] — 2026-06-14
 
-Initial release. Extracted from the trader-ai app (`lib/linear/client.rb` + `bin/linear`) into a
-standalone, project-agnostic gem so agent-ops and other projects can share one Linear tool. (AGT-43 /
-AGT-44.)
+Initial release. A standalone, project-agnostic gem (`Linear::Client` library + `linear` CLI) so any
+project can share one Linear tool.
 
 - `Linear::Client` library: multi-team resolution, full-text dedup search, create with dependency
   links (parent / blocks / blocked-by / related), label auto-create, lifecycle state transitions

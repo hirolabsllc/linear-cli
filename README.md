@@ -1,20 +1,14 @@
-# hgl_linear
+# linear_cli
 
-Standalone, project-agnostic **Linear** ticketing for Hiro Labs. One gem ships **both**:
+Standalone, project-agnostic **Linear** ticketing. One gem ships **both**:
 
 - **`Linear::Client`** — the single Ruby place all Linear GraphQL + lifecycle conventions live
   (multi-team, dedup search, relations, parent/sub-issue, state transitions, label auto-create,
   rate-limit backoff). Pure `net/http` + `json` — no Rails, no other runtime deps.
 - **`linear`** — a thin CLI over that client (`exe/linear`).
 
-It is configured by **environment only**, so every project — the trader-ai app, the agent-ops Hermes
-bot, Orcaru — drives the *same* tool against the *same* Linear workspace with zero app coupling.
-
-## Why this exists
-
-The implementation was extracted from the trader-ai app (`lib/linear/client.rb` + `bin/linear`) so
-agent-ops is no longer coupled to that app to file/track Linear issues. trader-ai now consumes this
-gem; the Hermes bot and Orcaru install the `linear` CLI directly. (Epic AGT-43.)
+It is configured by **environment only**, so any project can drive the *same* tool against the *same*
+Linear workspace with zero app coupling.
 
 ## Install
 
@@ -22,7 +16,7 @@ Git-source gem, pinned by tag (no private gem server):
 
 ```ruby
 # Gemfile
-gem "hgl_linear", git: "git@github.com:hirolabsllc/linear-cli", tag: "v1.0.0"
+gem "linear_cli", git: "git@github.com:hirolabsllc/linear-cli", tag: "v1.0.0"
 ```
 
 Or install the CLI standalone from a checkout:
@@ -30,7 +24,7 @@ Or install the CLI standalone from a checkout:
 ```bash
 git clone git@github.com:hirolabsllc/linear-cli
 cd linear-cli
-gem build hgl_linear.gemspec && gem install ./hgl_linear-1.0.0.gem
+gem build linear_cli.gemspec && gem install ./linear_cli-1.0.0.gem
 # `linear` is now on PATH (wherever RubyGems installs executables)
 ```
 
@@ -41,32 +35,32 @@ Ruby **3.4.9** is pinned via `.ruby-version` (rbenv auto-selects it in the repo 
 | Variable | Required | Purpose |
 |---|---|---|
 | `LINEAR_API_KEY` | yes | Linear personal API key — get one at <https://linear.app/settings/api> |
-| `LINEAR_DEFAULT_TEAM` | no | Default team key for `create` / `list` (e.g. `AGT`, `ORC`, `AKA`). A per-command `--team KEY` always wins. |
+| `LINEAR_DEFAULT_TEAM` | no | Default team key for `create` / `list` (e.g. `ENG`). A per-command `--team KEY` always wins. With neither set, `create` / `list` raise a clear error. |
 
 If the `dotenv` gem is available, a `.env` in the working directory is auto-loaded (so it "just
-works" inside a project checkout). On servers / the agent-ops box, export the vars directly.
+works" inside a project checkout). On servers, export the vars directly.
 
 ## CLI usage
 
 ```bash
 linear search "<keywords>"                       # dedup search (ALL states) — run BEFORE create
-linear create "Title" --team AGT --label Bug --priority high --desc "body"
-linear start  AGT-12 --session "my session"      # → In Progress
-linear review AGT-12 --sha <sha>                 # → In Review (+ clickable commit link)
-linear close  AGT-12 --comment "verified"        # → Done
-linear view   AGT-12                             # parent / sub-issues / relations
-linear list   --status in_progress --team AGT
+linear create "Title" --team ENG --label Bug --priority high --desc "body"
+linear start  ENG-12 --session "my session"      # → In Progress
+linear review ENG-12 --sha <sha>                 # → In Review (+ clickable commit link)
+linear close  ENG-12 --comment "verified"        # → Done
+linear view   ENG-12                             # parent / sub-issues / relations
+linear list   --status in_progress --team ENG
 ```
 
-Every command except `create` / `list` takes an issue id (`AKA-N`, `AGT-N`, …) and resolves its team
+Every command except `create` / `list` takes an issue id (e.g. `ENG-12`) and resolves its team
 automatically — no `--team` needed. Run `linear` with no args for the full command list.
 
 ## Library usage
 
 ```ruby
-require "hgl_linear"
+require "linear_cli"
 
-client = Linear::Client.new(team_key: "AGT")       # or Linear::Client.new for the default
+client = Linear::Client.new(team_key: "ENG")       # or Linear::Client.new to use LINEAR_DEFAULT_TEAM
 result = client.create(title: "Fix X", label: "Bug", priority: "high")
 client.transition(result[:issue]["identifier"], :in_progress, comment: "picked up")
 ```

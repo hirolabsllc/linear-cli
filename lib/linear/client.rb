@@ -4,13 +4,13 @@ require "net/http"
 require "uri"
 require "json"
 
-# Shared Linear GraphQL client — multi-team (AKA / AGT / ORC / …), default team configurable.
+# Shared Linear GraphQL client — multi-team, default team configurable.
 #
 # This is the ONE place the Linear GraphQL operations + conventions live. It ships in the standalone
-# `hgl_linear` gem so every surface drives this same class and the logic is never duplicated:
+# `linear_cli` gem so every surface drives this same class and the logic is never duplicated:
 #   * the `linear` CLI (the gem's `exe/linear`) — arg-parse + stdout only.
-#   * a host app's HTTP endpoint (e.g. trader-ai's `Api::V1::Admin::LinearIssuesController`) — lets
-#     external agents that run OUTSIDE a checkout file/update tickets with the same conventions.
+#   * a host app's HTTP endpoint (e.g. an admin controller) — lets external agents that run OUTSIDE a
+#     checkout file/update tickets with the same conventions.
 #
 # Pure Net::HTTP + JSON — it MUST NOT require Rails (or anything beyond stdlib) to boot, so the CLI
 # loads it standalone. It reads `LINEAR_API_KEY` from ENV and raises typed errors (nested under
@@ -19,7 +19,6 @@ require "json"
 module Linear
   class Client
     ENDPOINT = URI("https://api.linear.app/graphql")
-    DEFAULT_TEAM_KEY = "AKA"
 
     # --- typed errors --------------------------------------------------------
     # Callers rescue these instead of the client calling `exit`/`abort`.
@@ -57,9 +56,13 @@ module Linear
 
     attr_reader :team_key
 
-    def initialize(api_key: ENV["LINEAR_API_KEY"], team_key: DEFAULT_TEAM_KEY)
+    # The default team comes from LINEAR_DEFAULT_TEAM (or an explicit `team_key:`). There is no
+    # hardcoded fallback — create/list with no team configured raise a clear ConfigError (see
+    # {#team_id_for}); identifier-based commands resolve the team from the issue id and need none.
+    def initialize(api_key: ENV["LINEAR_API_KEY"], team_key: ENV["LINEAR_DEFAULT_TEAM"])
       @api_key  = api_key
-      @team_key = team_key
+      key       = team_key.to_s.strip
+      @team_key = key.empty? ? nil : key
     end
 
     def configured?
@@ -126,15 +129,21 @@ module Linear
 
     # --- team / workflow states / labels (memoized within an instance) -------
 
-    # All teams in the workspace ({ id, key }), fetched once per client. The workspace is multi-team
-    # (AKA / AGT / ORC / …); every team is resolved by KEY against this live list, so no team is ever
-    # hardcoded beyond the default-team fallback. (AKA-456)
+    # All teams in the workspace ({ id, key }), fetched once per client. The workspace may be
+    # multi-team; every team is resolved by KEY against this live list, so no team key is ever
+    # hardcoded.
     def teams
       @teams ||= graphql("query { teams { nodes { id key } } }").dig("teams", "nodes") || []
     end
 
-    # Resolve a team key (e.g. "AGT") to its Linear id. Raises if the workspace has no such team.
+    # Resolve a team key (e.g. "ENG") to its Linear id. Raises ConfigError when no team is configured
+    # (no LINEAR_DEFAULT_TEAM and no --team), or ApiError if the workspace has no such team.
     def team_id_for(key)
+      key = key.to_s.strip
+      if key.empty?
+        raise ConfigError, "No Linear team specified. Set LINEAR_DEFAULT_TEAM or pass a team key (e.g. --team ENG)."
+      end
+
       team = teams.find { |t| t["key"] == key }
       raise ApiError, "Team #{key} not found in Linear workspace" unless team
 
@@ -146,8 +155,9 @@ module Linear
       @team_id ||= team_id_for(team_key)
     end
 
-    # Workflow states for a given team id, memoized per team. A close/transition on an AGT issue must
-    # resolve AGT's "Done" state, not the default team's — so this is keyed by the ISSUE's team. (AKA-456)
+    # Workflow states for a given team id, memoized per team. A close/transition on an issue must
+    # resolve THAT issue's team's "Done" state, not the default team's — so this is keyed by the
+    # ISSUE's team.
     def workflow_states_for(t_id)
       (@workflow_states_by_team ||= {})[t_id] ||= begin
         data = graphql(<<~GQL, { teamId: t_id })
@@ -342,7 +352,7 @@ module Linear
     def transition(identifier, target, comment: nil)
       issue = find_issue!(identifier)
       # Resolve the target state from the ISSUE's OWN team, not the client default — so closing an
-      # AGT-N issue targets AGT's "Done", never AKA's (cross-team state ids don't apply). (AKA-456)
+      # issue targets its own team's "Done" (cross-team state ids don't apply).
       issue_team_id  = issue.dig("team", "id")
       issue_team_key = issue.dig("team", "key") || team_key
       states = issue_team_id ? workflow_states_for(issue_team_id) : workflow_states
@@ -412,7 +422,7 @@ module Linear
       { a: a["identifier"], b: b["identifier"], type: type }
     end
 
-    # Make AKA-CHILD a sub-issue of AKA-PARENT by identifier. Returns { child:, parent: }.
+    # Make CHILD a sub-issue of PARENT by identifier. Returns { child:, parent: }.
     def set_parent_by_identifier(child_ident, parent_ident)
       c = find_issue!(child_ident)
       p = find_issue!(parent_ident)
