@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.0.0] — 2026-06-15
+
+**Breaking — gem renamed.** The gem is now project-agnostic. The Ruby API is unchanged
+(`Linear::Client` and the `linear` CLI behave identically), but the package and namespace changed:
+
+- Gem name `hgl_linear` → **`linear_cli`**; module `HglLinear` → **`LinearCli`**. Consumers must
+  update `gem "hgl_linear"` → `gem "linear_cli"` and `require "hgl_linear"` → `require "linear_cli"`
+  (and `Gem.bin_path("hgl_linear", "linear")` → `Gem.bin_path("linear_cli", "linear")`).
+- Removed the hardcoded `DEFAULT_TEAM_KEY = "AKA"` default team. `Linear::Client` now reads
+  `LINEAR_DEFAULT_TEAM` with **no fallback**; `create` / `list` raise a clear `ConfigError` when no
+  team is configured (pass `--team KEY` or set `LINEAR_DEFAULT_TEAM`). Identifier-based commands are
+  unaffected (they resolve the team from the issue id).
+- Removed project-specific references from docs, comments, and tests.
+
+`v1.0.0` (the `hgl_linear` release) remains available by tag for anything still pinned to it.
+
 ## [1.0.0] — 2026-06-14
 
 Initial release. A standalone, project-agnostic gem (`Linear::Client` library + `linear` CLI) so any
