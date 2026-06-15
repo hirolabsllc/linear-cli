@@ -1,7 +1,12 @@
 ---
 name: linear-issues
+category: productivity
 description: Read and write Linear issues with the `linear` CLI. Use when asked to search Linear, read a Linear issue, create or update a ticket, move its status, or comment on it. The agent-ops team is AGT (the default); pass --team for another team (AKA = trader-ai app, ORC = orcaru).
 ---
+
+<!-- Install onto a Hermes profile with: hermes -p <profile> skills install <raw-url> --name linear-issues --category productivity -y
+     The `category: productivity` placement matters — the agent discovers ticketing skills by listing that category (skills_list "productivity"). AGT-41 / AGT-46. -->
+
 
 # Linear Issues
 
