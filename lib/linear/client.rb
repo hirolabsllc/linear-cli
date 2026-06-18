@@ -375,6 +375,55 @@ module Linear
       GQL
     end
 
+    # --- comment list / edit / delete (AGT-83) -------------------------------
+    # A stray comment posted by a fat-fingered flag (e.g. `comment ISSUE-N --show`) used to be
+    # un-removable from the CLI. These surface Linear's commentUpdate / commentDelete (and a way to
+    # discover comment ids), so a mistaken comment can be edited or deleted.
+
+    # List an issue's comments oldest-first (the order Linear returns), each node
+    # { "id", "body", "createdAt", "user" => { "name" } }. Used to discover the id to edit/delete.
+    # Raises NotFound when the issue identifier doesn't resolve.
+    def comments(identifier)
+      data = graphql(<<~GQL, { id: identifier })
+        query($id: String!) {
+          issue(id: $id) {
+            comments { nodes { id body createdAt user { name } } }
+          }
+        }
+      GQL
+      raise NotFound, "Issue #{identifier} not found" if data["issue"].nil?
+
+      data.dig("issue", "comments", "nodes") || []
+    end
+
+    # Edit a comment's body by comment id. Returns the updated comment node { "id", "body" }.
+    def update_comment(comment_id, body)
+      data = graphql(<<~GQL, { id: comment_id, body: body })
+        mutation($id: String!, $body: String!) {
+          commentUpdate(id: $id, input: { body: $body }) {
+            success
+            comment { id body }
+          }
+        }
+      GQL
+      raise ApiError, "Linear refused the comment update (id #{comment_id})" unless data.dig("commentUpdate", "success")
+
+      data.dig("commentUpdate", "comment")
+    end
+
+    # Delete a comment by comment id. Returns true on success.
+    def delete_comment(comment_id)
+      data = graphql(<<~GQL, { id: comment_id })
+        mutation($id: String!) {
+          commentDelete(id: $id) { success }
+        }
+      GQL
+      ok = data.dig("commentDelete", "success")
+      raise ApiError, "Linear refused the comment delete (id #{comment_id})" unless ok
+
+      ok
+    end
+
     # Add one or more labels to an issue, preserving existing labels (idempotent — Linear de-dupes by
     # id). Missing labels auto-create. Returns { identifier:, labels: }.
     def add_labels(identifier, names)

@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.1.0] — 2026-06-17
+
+**Comment edit/delete + file-based bodies + unknown-flag guard (AGT-83).** A stray comment posted by a
+fat-fingered flag (`comment ISSUE-N --show`) used to be un-removable from the CLI, and multi-line
+markdown bodies with backticks/parens broke under bash command substitution. Adds:
+
+- **`Linear::Client#comments` / `#update_comment` / `#delete_comment`** — list an issue's comments
+  (id + timestamp + author + body), edit a comment body (`commentUpdate`), and delete a comment
+  (`commentDelete`). Reusable by any host (e.g. the admin `LinearIssuesController`).
+- **CLI `comments` / `comment-edit` / `comment-delete` subcommands.** `comments ISSUE-N` lists comment
+  ids; `comment-edit ISSUE-N <id> "new body"` and `comment-delete ISSUE-N <id>` edit/remove one. Both
+  guard that the comment actually belongs to ISSUE-N (a typo'd id / wrong issue aborts with a hint).
+  `view ISSUE-N` now also lists comment ids for discoverability.
+- **File-based bodies** (borrowed from schpet/linear-cli) — `create --desc-file PATH`
+  (alias `--description-file`) and `comment` / `comment-edit --body-file PATH` read the body from a
+  file instead of a shell arg, sidestepping shell-escaping/quoting bugs with multi-line markdown.
+- **Unknown-flag rejection** on `create` / `comment` / `comment-edit` / `comment-delete`: an
+  unrecognized `--flag` now aborts with a clear error instead of being silently swallowed (or, for
+  `comment`, posted as the body) — the fat-finger that motivated this ticket can no longer create junk.
+
 ## [2.0.1] — 2026-06-15
 
 **Resilience — transient state-transition failures now self-heal (AKA-491).** A single transient blip

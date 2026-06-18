@@ -398,6 +398,57 @@ class Linear::ClientTest < LinearCli::TestCase
     assert_equal Linear::Client::MAX_TRANSIENT_ATTEMPTS, gql_calls
   end
 
+  # --- comment list / edit / delete (AGT-83) --------------------------------
+
+  test "comments returns the issue's comment nodes" do
+    payload = { "issue" => { "comments" => { "nodes" => [
+      { "id" => "c1", "body" => "first",  "createdAt" => "t1", "user" => { "name" => "A" } },
+      { "id" => "c2", "body" => "second", "createdAt" => "t2", "user" => { "name" => "B" } }
+    ] } } }
+    client.stub(:graphql, ->(*_a) { payload }) do
+      assert_equal %w[c1 c2], client.comments("AGT-1").map { |n| n["id"] }
+    end
+  end
+
+  test "comments returns an empty array for an issue with no comments" do
+    client.stub(:graphql, ->(*_a) { { "issue" => { "comments" => { "nodes" => [] } } } }) do
+      assert_empty client.comments("AGT-1")
+    end
+  end
+
+  test "comments raises NotFound when the issue does not exist" do
+    client.stub(:graphql, ->(*_a) { { "issue" => nil } }) do
+      assert_raises(Linear::Client::NotFound) { client.comments("AGT-404") }
+    end
+  end
+
+  test "delete_comment returns true on success" do
+    client.stub(:graphql, ->(*_a) { { "commentDelete" => { "success" => true } } }) do
+      assert_equal true, client.delete_comment("c1")
+    end
+  end
+
+  test "delete_comment raises ApiError when Linear reports no success" do
+    client.stub(:graphql, ->(*_a) { { "commentDelete" => { "success" => false } } }) do
+      err = assert_raises(Linear::Client::ApiError) { client.delete_comment("c1") }
+      assert_match(/comment delete/, err.message)
+    end
+  end
+
+  test "update_comment returns the updated comment node on success" do
+    payload = { "commentUpdate" => { "success" => true, "comment" => { "id" => "c1", "body" => "new" } } }
+    client.stub(:graphql, ->(*_a) { payload }) do
+      assert_equal "new", client.update_comment("c1", "new")["body"]
+    end
+  end
+
+  test "update_comment raises ApiError when the update fails" do
+    client.stub(:graphql, ->(*_a) { { "commentUpdate" => { "success" => false } } }) do
+      err = assert_raises(Linear::Client::ApiError) { client.update_comment("c1", "x") }
+      assert_match(/comment update/, err.message)
+    end
+  end
+
   test "retry_delay honors the Retry-After header over exponential backoff" do
     r = resp(code: 429, body: "", headers: { "Retry-After" => "7" })
     assert_in_delta 7.0, client.send(:retry_delay, r, 1), 0.001

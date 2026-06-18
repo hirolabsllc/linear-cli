@@ -48,9 +48,18 @@ linear create "Title" --team ENG --label Bug --priority high --desc "body"
 linear start  ENG-12 --session "my session"      # → In Progress
 linear review ENG-12 --sha <sha>                 # → In Review (+ clickable commit link)
 linear close  ENG-12 --comment "verified"        # → Done
-linear view   ENG-12                             # parent / sub-issues / relations
+linear view   ENG-12                             # parent / sub-issues / relations + comment ids
 linear list   --status in_progress --team ENG
+
+linear comment        ENG-12 "QA passed"         # or: --body-file notes.md (avoids shell escaping)
+linear comments       ENG-12                      # list comment ids
+linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md
+linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comment
 ```
+
+Multi-line markdown with backticks/parens breaks under bash command substitution, so `create` accepts
+`--desc-file PATH` and `comment` / `comment-edit` accept `--body-file PATH` to read the body from a
+file. Unknown flags are rejected (a typo like `comment ENG-12 --show` errors instead of posting junk).
 
 Every command except `create` / `list` takes an issue id (e.g. `ENG-12`) and resolves its team
 automatically — no `--team` needed. Run `linear` with no args for the full command list.

@@ -167,6 +167,28 @@ def join_md(*parts)
   parts.flatten.reject { |s| s.nil? || s.to_s.strip.empty? }.join("\n\n")
 end
 
+# --- file-based bodies + flag validation (AGT-83) ------------------------------
+# Multi-line markdown with backticks/parens breaks under bash command substitution when passed as a
+# --desc / comment arg, so create + comment also accept a PATH to read the body from a file. And a
+# mistyped flag (the `comment ISSUE-N --show` typo that posted a stray no-op comment) is now rejected
+# instead of being swallowed as input.
+
+# Read a markdown body from a file (for --desc-file / --body-file). Re-tags as UTF-8 (file may be
+# ASCII-8BIT) so it joins cleanly with the UTF-8 markdown we build; `.scrub` keeps bad bytes non-fatal.
+def read_body_file(path)
+  abort "Body file not found: #{path}" unless File.file?(path)
+
+  File.read(path).force_encoding("UTF-8").scrub
+end
+
+# Abort with a clear message if any unrecognized --flags were collected, so a fat-finger (e.g. --show)
+# can't be silently treated as input. `cmd` names the subcommand in the error.
+def reject_unknown_flags!(unknown, cmd)
+  return if unknown.nil? || unknown.empty?
+
+  abort "Unknown flag(s) for #{cmd}: #{unknown.join(" ")} — run `#{PROG}` with no args for usage."
+end
+
 # Human-readable parent / sub-issue / relation lines for an issue node returned by
 # CLIENT.find_issue (carries parent/children/relations/inverseRelations). Pure formatting.
 def format_issue_links(issue)
@@ -194,6 +216,7 @@ def cmd_create(args)
   parent_ref = nil
   blocks_refs, blocked_by_refs, related_refs = [], [], []
   team_key = default_team   # --team KEY > $LINEAR_DEFAULT_TEAM (no hardcoded fallback)
+  unknown = []
 
   i = 0
   while i < args.length
@@ -202,14 +225,17 @@ def cmd_create(args)
     when "--label"                  then label_name    = args[i + 1]; i += 2
     when "--priority"               then priority_name = args[i + 1]; i += 2
     when "--desc", "--description"  then description   = args[i + 1]; i += 2
+    when "--desc-file", "--description-file" then description = read_body_file(args[i + 1]); i += 2
     when "--image"                  then images       << args[i + 1]; i += 2
     when "--parent"                 then parent_ref     = args[i + 1]; i += 2
     when "--blocks"                 then blocks_refs   << args[i + 1]; i += 2
     when "--blocked-by", "--depends-on", "--after" then blocked_by_refs << args[i + 1]; i += 2
     when "--related", "--relates-to"               then related_refs    << args[i + 1]; i += 2
+    when /\A--/                     then unknown      << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "create")
 
   # Always attach screenshots when given — uploaded and embedded under a Screenshots heading. (Image
   # upload is a local-file concern, so the CLI builds the final description, then hands it to the client.)
@@ -255,6 +281,94 @@ def cmd_view(args)
   end
   puts  ""
   puts issue["description"] if issue["description"] && !issue["description"].empty?
+
+  # List comment ids so they're discoverable for `comment-edit` / `comment-delete` (a separate query
+  # — find_issue stays lean for the hot transition path).
+  list = CLIENT.comments(identifier)
+  unless list.empty?
+    puts ""
+    puts "Comments (#{list.length}) — id for `#{PROG} comment-edit`/`comment-delete`:"
+    list.each { |c| puts "  #{comment_line(c)}" }
+  end
+end
+
+# One-line summary of a comment node for `view` / `comments`: id, timestamp, author, and the first
+# line of the body (truncated). Used wherever comment ids are surfaced.
+def comment_line(c)
+  who     = c.dig("user", "name") || "?"
+  first   = c["body"].to_s.strip.split("\n").first.to_s
+  snippet = first.length > 70 ? "#{first[0, 70]}…" : first
+  base    = "#{c["id"]}  #{c["createdAt"]}  @#{who}"
+  snippet.empty? ? base : "#{base}  #{snippet}"
+end
+
+# List an issue's comments with their ids (the discoverability surface for comment-edit/delete).
+def cmd_comments(args)
+  identifier = args.shift or abort "Usage: #{PROG} comments ISSUE-N"
+  list = CLIENT.comments(identifier)
+  if list.empty?
+    puts "No comments on #{identifier}."
+    return
+  end
+  puts "#{list.length} comment(s) on #{identifier} (id  time  author  first line):"
+  list.each { |c| puts comment_line(c) }
+end
+
+# Edit an existing comment's body by comment id. New body comes from the positional arg or --body-file
+# (the file form avoids shell-escaping multi-line markdown). The comment must belong to ISSUE-N.
+def cmd_comment_edit(args)
+  identifier = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH"
+  comment_id = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH"
+  body_file = nil
+  positionals = []
+  unknown = []
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--body-file" then body_file = args[i + 1]; i += 2
+    when /\A--/        then unknown << args[i]; i += 1
+    else positionals << args[i]; i += 1
+    end
+  end
+  reject_unknown_flags!(unknown, "comment-edit")
+
+  body = positionals.shift
+  if body_file
+    abort "Pass either a body argument or --body-file, not both." if body
+    body = read_body_file(body_file)
+  end
+  abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH" if body.nil? || body.strip.empty?
+
+  ensure_comment_on_issue!(identifier, comment_id)
+  CLIENT.update_comment(comment_id, body)
+  puts "Updated comment #{comment_id} on #{identifier}."
+end
+
+# Delete a comment by comment id. The comment must belong to ISSUE-N (guards a wrong-issue / typo'd id).
+def cmd_comment_delete(args)
+  identifier = args.shift or abort "Usage: #{PROG} comment-delete ISSUE-N <comment-id>"
+  comment_id = args.shift or abort "Usage: #{PROG} comment-delete ISSUE-N <comment-id>"
+  unknown = []
+  i = 0
+  while i < args.length
+    case args[i]
+    when /\A--/ then unknown << args[i]; i += 1
+    else i += 1
+    end
+  end
+  reject_unknown_flags!(unknown, "comment-delete")
+
+  ensure_comment_on_issue!(identifier, comment_id)
+  CLIENT.delete_comment(comment_id)
+  puts "Deleted comment #{comment_id} from #{identifier}."
+end
+
+# Guard: the comment id must be one of ISSUE-N's comments — so a typo'd id or a wrong issue can't
+# silently target someone else's comment. Aborts with a hint to `comments ISSUE-N` otherwise.
+def ensure_comment_on_issue!(identifier, comment_id)
+  return if CLIENT.comments(identifier).any? { |c| c["id"] == comment_id }
+
+  abort "Comment #{comment_id} not found on #{identifier}. Run `#{PROG} comments #{identifier}` to list ids."
 end
 
 def cmd_url(args)
@@ -319,16 +433,32 @@ def cmd_list(args)
 end
 
 def cmd_comment(args)
-  identifier = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" [--image PATH ...]"
-  body = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" [--image PATH ...]"
+  identifier = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH [--image PATH ...]"
   images = []
+  body_file = nil
+  positionals = []
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--image" then images << args[i + 1]; i += 2
-    else i += 1
+    when "--image"     then images << args[i + 1]; i += 2
+    when "--body-file" then body_file = args[i + 1]; i += 2
+    when /\A--/        then unknown << args[i]; i += 1
+    else positionals << args[i]; i += 1
     end
   end
+  reject_unknown_flags!(unknown, "comment")
+
+  # Body from the positional arg or --body-file (the file form avoids shell-escaping markdown). Rejecting
+  # unknown flags above means a typo like `comment ISSUE-N --show` errors instead of being posted as a
+  # stray comment (the bug that motivated AGT-83).
+  body = positionals.shift
+  if body_file
+    abort "Pass either a body argument or --body-file, not both." if body
+    body = read_body_file(body_file)
+  end
+  abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH [--image PATH ...]" if body.nil? || body.strip.empty?
+
   body = join_md(body, images_markdown(images)) if images.any?
   CLIENT.comment(identifier, body)
   puts "Comment added to #{identifier}."
@@ -556,6 +686,9 @@ begin
   when "relate"  then cmd_relate(ARGV)
   when "unrelate" then cmd_unrelate(ARGV)
   when "comment" then cmd_comment(ARGV)
+  when "comments"        then cmd_comments(ARGV)
+  when "comment-edit"    then cmd_comment_edit(ARGV)
+  when "comment-delete"  then cmd_comment_delete(ARGV)
   when "attach"  then cmd_attach(ARGV)
   when "commit"  then cmd_commit(ARGV)
   when "start"   then cmd_start(ARGV)
@@ -570,7 +703,7 @@ begin
       issue id (e.g. ENG-123) and resolves its team automatically — no --team needed.
 
       Commands:
-        create  "Title" [--team KEY] [--label Bug|Feature|Infrastructure|Ops] [--priority urgent|high|medium|low] [--desc "body"] [--image PATH ...]
+        create  "Title" [--team KEY] [--label Bug|Feature|Infrastructure|Ops] [--priority urgent|high|medium|low] [--desc "body" | --desc-file PATH] [--image PATH ...]
                 [--parent ISSUE-N] [--blocked-by ISSUE-N] [--blocks ISSUE-N] [--related ISSUE-N]   ← link deps AT create time
         search  "<keywords>" [--limit N]             full-text dedup search (ALL states; run BEFORE create)
         list    [--status todo|in_progress|done] [--label Bug] [--team KEY]
@@ -584,7 +717,10 @@ begin
         start   ISSUE-N [--session "session name"]     move to In Progress + log session attribution
         review  ISSUE-N [--sha <sha>]                  move to In Review + log merged SHA as a GitHub link
         commit  ISSUE-N [--sha <ref>] [--note "..."]   link a commit (clickable GitHub link + subject; default HEAD)
-        comment ISSUE-N "body" [--image PATH ...]      add a comment (QA result, notes, etc.)
+        comment ISSUE-N "body" | --body-file PATH [--image PATH ...]   add a comment (QA result, notes, etc.)
+        comments        ISSUE-N                          list this issue's comments + their ids
+        comment-edit    ISSUE-N <comment-id> "new body" | --body-file PATH   edit a comment
+        comment-delete  ISSUE-N <comment-id>            delete a comment (e.g. a stray/mistaken one)
         attach  ISSUE-N PATH [PATH ...] [--note "..."]  attach screenshot(s) — repro/QA evidence
         label   ISSUE-N <label>                         add a label (auto-creates it if missing)
         close   ISSUE-N [--comment "reason"]           mark Done (verified on prod)
