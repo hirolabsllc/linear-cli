@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.2.0] — 2026-06-18
+
+**`priority` command + a general field setter (AGT-84).** The CLI could edit only an issue's title
+(`retitle`) and lifecycle state (`start`/`review`/`close`/`cancel`/`reopen`) — there was no command to
+change priority or any other field, so bumping a ticket's priority meant dropping to a raw
+`issueUpdate(input:{priority:N})` mutation, which defeats the shared CLI (hit live bumping AKA-260
+High→Urgent). Adds:
+
+- **`Linear::Client#set_priority` / `#set` / `#update_issue`.** `set_priority(id, word)` changes priority
+  by word (urgent|high|medium|low|none) and reports the human-readable old→new (mirrors `retitle`).
+  `set(id, priority:/assignee:/estimate:/due:/label:)` is a general field setter that resolves the
+  human inputs and applies priority/assignee/estimate/due in a SINGLE `issueUpdate`, merging any labels
+  via `add_labels` (existing preserved). `update_issue(id, input)` is the low-level `issueUpdate`
+  wrapper (resolution-free) reusable by any host (e.g. the admin `LinearIssuesController`). Pure inputs
+  (priority word, estimate, due format) are validated **before** any network call, so a bad value never
+  half-applies. New helpers `#priority_int` (strict word→int, unlike the medium-defaulting
+  `#priority_value` used by `create`), `#viewer_id`, `#user_id_for_email`, `#assignee_id_for`.
+- **CLI `priority` (alias `prio`) and `set` subcommands.** `priority ISSUE-N high` prints old→new;
+  `set ISSUE-N [--priority X] [--assignee me|email] [--estimate N] [--due YYYY-MM-DD] [--label NAME]`
+  changes any subset of fields in one call and prints each change. An empty `--due` clears the due date;
+  unknown flags are rejected. `priority` delegates to `set`.
+
 ## [2.1.0] — 2026-06-17
 
 **Comment edit/delete + file-based bodies + unknown-flag guard (AGT-83).** A stray comment posted by a

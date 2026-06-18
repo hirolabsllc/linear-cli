@@ -386,6 +386,48 @@ def cmd_retitle(args)
   puts updated["url"]
 end
 
+# Change an issue's priority by word (urgent|high|medium|low|none). Reports old → new, mirroring
+# `retitle`. The general `set` command can do this too; `priority` is the one-word shortcut for the
+# field that gets bumped most.
+def cmd_priority(args)
+  identifier = args.shift or abort "Usage: #{PROG} priority ISSUE-N urgent|high|medium|low|none"
+  word       = args.shift or abort "Usage: #{PROG} priority ISSUE-N urgent|high|medium|low|none"
+  unknown = args.select { |a| a =~ /\A--/ }
+  reject_unknown_flags!(unknown, "priority")
+
+  res = CLIENT.set_priority(identifier, word)
+  puts "#{res[:identifier]}: priority #{res[:old]} → #{res[:new]}"
+  puts res[:url]
+end
+
+# General field setter — change priority/assignee/estimate/due/label in one call so each field no
+# longer needs a one-off raw GraphQL mutation. Any subset of flags; prints each old → new change.
+def cmd_set(args)
+  identifier = args.shift or abort "Usage: #{PROG} set ISSUE-N [--priority X] [--assignee me|email] [--estimate N] [--due YYYY-MM-DD] [--label NAME]"
+  priority = assignee = estimate = due = nil
+  labels  = []
+  unknown = []
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--priority" then priority = args[i + 1]; i += 2
+    when "--assignee" then assignee = args[i + 1]; i += 2
+    when "--estimate" then estimate = args[i + 1]; i += 2
+    when "--due"      then due      = args[i + 1]; i += 2
+    when "--label"    then labels  << args[i + 1]; i += 2
+    when /\A--/       then unknown << args[i]; i += 1
+    else i += 1
+    end
+  end
+  reject_unknown_flags!(unknown, "set")
+
+  res = CLIENT.set(identifier, priority: priority, assignee: assignee, estimate: estimate, due: due,
+                               label: labels.empty? ? nil : labels)
+  puts "#{res[:identifier]} updated:"
+  res[:changes].each { |c| puts "  #{c[:field]}: #{c[:from]} → #{c[:to]}" }
+  puts res[:url]
+end
+
 def cmd_close(args)
   identifier = args.shift or abort "Usage: #{PROG} close ISSUE-N [--comment \"reason\"]"
   comment = nil
@@ -677,6 +719,8 @@ begin
   when "view"    then cmd_view(ARGV)
   when "url"     then cmd_url(ARGV)
   when "retitle", "rename" then cmd_retitle(ARGV)
+  when "priority", "prio"   then cmd_priority(ARGV)
+  when "set"     then cmd_set(ARGV)
   when "close"   then cmd_close(ARGV)
   when "cancel"  then cmd_cancel(ARGV)
   when "list"    then cmd_list(ARGV)
@@ -710,6 +754,8 @@ begin
         view    ISSUE-N                                shows parent/sub-issues/relations under "Links:"
         url     ISSUE-N
         retitle ISSUE-N "New title"                     change an issue's title (alias: rename); prints old → new
+        priority ISSUE-N urgent|high|medium|low|none    change priority (alias: prio); prints old → new
+        set     ISSUE-N [--priority X] [--assignee me|email] [--estimate N] [--due YYYY-MM-DD] [--label NAME]   set field(s) in one call
         reopen  ISSUE-N [--in-progress] [--comment "why"]   move a Done/Canceled issue back (recurrence)
         parent  CHILD PARENT                  make CHILD a sub-issue of an epic (native hierarchy + rollup)
         relate  ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]   link two issues (real Linear relation)

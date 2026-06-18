@@ -50,7 +50,7 @@ module Linear
       "ops"            => "#f2c94c"
     }.freeze
 
-    PRIORITY_MAP   = { "urgent" => 1, "high" => 2, "medium" => 3, "low" => 4, "no" => 0 }.freeze
+    PRIORITY_MAP   = { "urgent" => 1, "high" => 2, "medium" => 3, "low" => 4, "no" => 0, "none" => 0 }.freeze
     PRIORITY_LABEL = { 0 => "No priority", 1 => "Urgent", 2 => "High", 3 => "Medium", 4 => "Low" }.freeze
 
     # Linear's IssueRelationType enum. "blocked-by" is a CLI/API convenience that swaps direction.
@@ -260,8 +260,44 @@ module Linear
       PRIORITY_MAP[name.to_s.downcase] || 3
     end
 
+    # Strict word→int for the `priority`/`set` commands: unlike {#priority_value} (which defaults to
+    # medium so `create` never fails on a typo'd --priority), an unrecognized word raises InvalidInput
+    # so an explicit priority change can't silently land on the wrong value.
+    def priority_int(word)
+      key = word.to_s.strip.downcase
+      PRIORITY_MAP.fetch(key) do
+        raise InvalidInput, "Unknown priority #{word.inspect}; use urgent | high | medium | low | none"
+      end
+    end
+
     def priority_label(value)
       PRIORITY_LABEL[value] || "?"
+    end
+
+    # The authenticated user's id (for `--assignee me`), fetched once per client.
+    def viewer_id
+      @viewer_id ||= graphql("query { viewer { id } }").dig("viewer", "id")
+    end
+
+    # Resolve a Linear user id by exact email. Raises NotFound when no user matches.
+    def user_id_for_email(email)
+      data = graphql(<<~GQL, { email: email })
+        query($email: String!) {
+          users(filter: { email: { eq: $email } }) { nodes { id name email } }
+        }
+      GQL
+      node = (data.dig("users", "nodes") || []).first
+      raise NotFound, "No Linear user with email #{email}" unless node
+
+      node["id"]
+    end
+
+    # Resolve an assignee spec ("me" or an email) to a Linear user id.
+    def assignee_id_for(spec)
+      v = spec.to_s.strip
+      raise InvalidInput, "No assignee given" if v.empty?
+
+      v.casecmp?("me") ? viewer_id : user_id_for_email(v)
     end
 
     # --- issue lookup --------------------------------------------------------
@@ -271,7 +307,7 @@ module Linear
       data = graphql(<<~GQL, { id: identifier })
         query($id: String!) {
           issue(id: $id) {
-            id identifier title url priority
+            id identifier title url priority estimate dueDate
             team { id key }
             state { name type }
             assignee { name }
@@ -357,6 +393,103 @@ module Linear
         }
       GQL
       { old_title: old_title, issue: data.dig("issueUpdate", "issue") }
+    end
+
+    # --- generic field setter + priority (AGT-84) ----------------------------
+    # The ONE place a non-state/non-title field is changed. Before this, bumping a ticket's priority (or
+    # assignee/estimate/due) meant dropping to a raw `issueUpdate` mutation, which defeats the shared
+    # CLI. {#set} resolves the human inputs and applies them in a SINGLE issueUpdate; {#set_priority} is
+    # the focused priority path that delegates to it.
+
+    # Low-level issueUpdate wrapper: takes an already-resolved IssueUpdateInput hash and returns the
+    # updated issue node. Raises InvalidInput on an empty input (no field to change) and ApiError if
+    # Linear reports no success. Reusable by any host (e.g. an admin controller) — no resolution here.
+    def update_issue(issue_id, input)
+      raise InvalidInput, "No fields to update" if input.nil? || input.empty?
+
+      data = graphql(<<~GQL, { id: issue_id, input: input })
+        mutation($id: String!, $input: IssueUpdateInput!) {
+          issueUpdate(id: $id, input: $input) {
+            success
+            issue {
+              identifier title url priority estimate dueDate
+              state { name }
+              assignee { name }
+              labels { nodes { name } }
+            }
+          }
+        }
+      GQL
+      raise ApiError, "Linear refused the issue update (#{issue_id})" unless data.dig("issueUpdate", "success")
+
+      data.dig("issueUpdate", "issue")
+    end
+
+    # General field setter. Any subset of:
+    #   priority: word (urgent|high|medium|low|none)
+    #   assignee: "me" | email
+    #   estimate: integer points
+    #   due:      "YYYY-MM-DD" (or "" to clear)
+    #   label:    label name(s) to ADD — auto-created, existing labels preserved
+    # Pure inputs (priority word, estimate, due format) are validated BEFORE any network call so a bad
+    # value never half-applies. priority/assignee/estimate/due land in one issueUpdate; labels merge via
+    # {#add_labels} (which preserves existing). Returns { identifier:, url:, changes: [{field:,from:,to:}] }.
+    def set(identifier, priority: nil, assignee: nil, estimate: nil, due: nil, label: nil)
+      # Validate the pure inputs first (no network on bad input) — mirrors relate's type check.
+      pri_val     = priority.nil? ? nil : priority_int(priority)
+      est_val     = estimate.nil? ? nil : parse_estimate(estimate)
+      due_val     = due.nil? ? nil : parse_due(due)
+      label_names = Array(label).map(&:to_s).reject { |n| n.strip.empty? }
+
+      if pri_val.nil? && assignee.nil? && est_val.nil? && due_val.nil? && label_names.empty?
+        raise InvalidInput, "Nothing to set — pass at least one of priority/assignee/estimate/due/label"
+      end
+
+      issue   = find_issue!(identifier)
+      input   = {}
+      changes = []
+
+      unless pri_val.nil?
+        input[:priority] = pri_val
+        changes << { field: "priority", from: priority_label(issue["priority"]), to: priority_label(pri_val) }
+      end
+      unless assignee.nil?
+        input[:assigneeId] = assignee_id_for(assignee)
+        changes << { field: "assignee", from: issue.dig("assignee", "name") || "unassigned", to: assignee }
+      end
+      unless est_val.nil?
+        input[:estimate] = est_val
+        changes << { field: "estimate", from: issue["estimate"] || "none", to: est_val }
+      end
+      unless due_val.nil?
+        if due_val == :clear
+          input[:dueDate] = nil
+          changes << { field: "due", from: issue["dueDate"] || "none", to: "(cleared)" }
+        else
+          input[:dueDate] = due_val
+          changes << { field: "due", from: issue["dueDate"] || "none", to: due_val }
+        end
+      end
+
+      updated = input.empty? ? issue : update_issue(issue["id"], input)
+
+      unless label_names.empty?
+        existing = (issue.dig("labels", "nodes") || []).map { |l| l["name"] }
+        add_labels(identifier, label_names)
+        changes << { field: "labels", from: existing.join(",").empty? ? "none" : existing.join(","),
+                     to: "+#{label_names.join(",")}" }
+      end
+
+      { identifier: issue["identifier"], url: updated["url"] || issue["url"], changes: changes }
+    end
+
+    # Focused priority change by word. Validates the word before any network call and reports the
+    # human-readable old→new (mirrors how {#retitle} reports its change). Returns
+    # { identifier:, url:, old:, new: }.
+    def set_priority(identifier, word)
+      res    = set(identifier, priority: word)
+      change = res[:changes].find { |c| c[:field] == "priority" }
+      { identifier: res[:identifier], url: res[:url], old: change[:from], new: change[:to] }
     end
 
     # Add a comment to an issue (resolves the identifier first). Returns the issue identifier.
@@ -646,6 +779,23 @@ module Linear
 
     def link_result(kind, ref, issue_node, ok)
       { kind: kind, ref: ref, identifier: issue_node && issue_node["identifier"], ok: !!ok }
+    end
+
+    # Parse an estimate to a plain integer (Linear estimate points), raising InvalidInput on non-numeric
+    # input so a typo'd --estimate never silently coerces to 0.
+    def parse_estimate(value)
+      Integer(value.to_s.strip, 10)
+    rescue ArgumentError, TypeError
+      raise InvalidInput, "Estimate must be an integer, got #{value.inspect}"
+    end
+
+    # Validate a due-date string. Empty ⇒ :clear (unset the due date); otherwise it must be YYYY-MM-DD.
+    def parse_due(value)
+      v = value.to_s.strip
+      return :clear if v.empty?
+      raise InvalidInput, "Due date must be YYYY-MM-DD, got #{value.inspect}" unless v.match?(/\A\d{4}-\d{2}-\d{2}\z/)
+
+      v
     end
 
     # Resolve a target lifecycle symbol to its workflow-state node, mirroring the by-name/by-type
