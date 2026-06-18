@@ -449,6 +449,129 @@ class Linear::ClientTest < LinearCli::TestCase
     end
   end
 
+  # --- priority + generic field setter (AGT-84) -----------------------------
+
+  test "priority_int maps words strictly and rejects an unknown one" do
+    assert_equal 1, client.priority_int("urgent")
+    assert_equal 2, client.priority_int("HIGH")
+    assert_equal 3, client.priority_int("medium")
+    assert_equal 4, client.priority_int("low")
+    assert_equal 0, client.priority_int("none")
+    assert_equal 0, client.priority_int("no")
+    err = assert_raises(Linear::Client::InvalidInput) { client.priority_int("bogus") }
+    assert_match(/Unknown priority/, err.message)
+  end
+
+  test "update_issue rejects an empty input before any network call" do
+    client.stub(:graphql, ->(*_a) { flunk "must not hit the network on an empty update" }) do
+      assert_raises(Linear::Client::InvalidInput) { client.update_issue("i-1", {}) }
+    end
+  end
+
+  test "update_issue raises ApiError when Linear reports no success" do
+    client.stub(:graphql, ->(*_a) { { "issueUpdate" => { "success" => false } } }) do
+      err = assert_raises(Linear::Client::ApiError) { client.update_issue("i-1", { priority: 1 }) }
+      assert_match(/issue update/, err.message)
+    end
+  end
+
+  test "update_issue returns the updated issue node on success" do
+    payload = { "issueUpdate" => { "success" => true, "issue" => { "identifier" => "AGT-1", "priority" => 1, "url" => "u" } } }
+    client.stub(:graphql, ->(*_a) { payload }) do
+      assert_equal "AGT-1", client.update_issue("i-1", { priority: 1 })["identifier"]
+    end
+  end
+
+  test "set_priority validates the word BEFORE touching the network" do
+    client.stub(:find_issue!, ->(_id) { flunk "must validate the word before resolving the issue" }) do
+      err = assert_raises(Linear::Client::InvalidInput) { client.set_priority("AGT-1", "bogus") }
+      assert_match(/Unknown priority/, err.message)
+    end
+  end
+
+  test "set_priority reports the human-readable old → new and sends the right int" do
+    issue = { "id" => "i-1", "identifier" => "AGT-1", "priority" => 2, "url" => "u" }
+    captured = nil
+    client.stub(:find_issue!, ->(_id) { issue }) do
+      client.stub(:update_issue, ->(_id, input) { captured = input; { "url" => "u" } }) do
+        res = client.set_priority("AGT-1", "urgent")
+        assert_equal "High",   res[:old]
+        assert_equal "Urgent", res[:new]
+        assert_equal 1, captured[:priority]
+      end
+    end
+  end
+
+  test "set raises InvalidInput when no fields are given" do
+    client.stub(:find_issue!, ->(_id) { flunk "must reject an empty set before any lookup" }) do
+      assert_raises(Linear::Client::InvalidInput) { client.set("AGT-1") }
+    end
+  end
+
+  test "set validates estimate and due format before the network" do
+    client.stub(:find_issue!, ->(_id) { flunk "bad input must be caught before the lookup" }) do
+      assert_raises(Linear::Client::InvalidInput) { client.set("AGT-1", estimate: "abc") }
+      assert_raises(Linear::Client::InvalidInput) { client.set("AGT-1", due: "2026/07/01") }
+    end
+  end
+
+  test "set resolves 'me', estimate, due, and priority into ONE issueUpdate" do
+    issue = {
+      "id" => "i-1", "identifier" => "AGT-1", "priority" => 3, "assignee" => nil,
+      "estimate" => nil, "dueDate" => nil, "url" => "u", "labels" => { "nodes" => [] }
+    }
+    captured = nil
+    client.stub(:find_issue!, ->(_id) { issue }) do
+      client.stub(:viewer_id, "u-me") do
+        client.stub(:update_issue, ->(_id, input) { captured = input; { "url" => "u" } }) do
+          res = client.set("AGT-1", priority: "low", assignee: "me", estimate: "5", due: "2026-07-01")
+          assert_equal 4,          captured[:priority]
+          assert_equal "u-me",     captured[:assigneeId]
+          assert_equal 5,          captured[:estimate]
+          assert_equal "2026-07-01", captured[:dueDate]
+          assert_equal 4, res[:changes].length
+        end
+      end
+    end
+  end
+
+  test "set with an empty --due clears the due date" do
+    issue = { "id" => "i-1", "identifier" => "AGT-1", "dueDate" => "2026-01-01", "url" => "u", "labels" => { "nodes" => [] } }
+    captured = nil
+    client.stub(:find_issue!, ->(_id) { issue }) do
+      client.stub(:update_issue, ->(_id, input) { captured = input; { "url" => "u" } }) do
+        res = client.set("AGT-1", due: "")
+        assert captured.key?(:dueDate)
+        assert_nil captured[:dueDate]
+        assert_equal "(cleared)", res[:changes].first[:to]
+      end
+    end
+  end
+
+  test "set merges labels via add_labels (preserving existing) without an issueUpdate" do
+    issue = { "id" => "i-1", "identifier" => "AGT-1", "url" => "u", "labels" => { "nodes" => [{ "name" => "Bug" }] } }
+    added = nil
+    client.stub(:find_issue!, ->(_id) { issue }) do
+      client.stub(:update_issue, ->(*_a) { flunk "labels-only set must not call issueUpdate" }) do
+        client.stub(:add_labels, ->(_id, names) { added = names; { identifier: "AGT-1", labels: names } }) do
+          res = client.set("AGT-1", label: ["Feature"])
+          assert_equal ["Feature"], added
+          assert_equal "labels", res[:changes].first[:field]
+        end
+      end
+    end
+  end
+
+  test "assignee_id_for resolves 'me' to the viewer and an email via lookup" do
+    client.stub(:viewer_id, "u-me") do
+      assert_equal "u-me", client.assignee_id_for("me")
+      assert_equal "u-me", client.assignee_id_for("ME")
+    end
+    client.stub(:user_id_for_email, ->(email) { "u-#{email}" }) do
+      assert_equal "u-dev@x.com", client.assignee_id_for("dev@x.com")
+    end
+  end
+
   test "retry_delay honors the Retry-After header over exponential backoff" do
     r = resp(code: 429, body: "", headers: { "Retry-After" => "7" })
     assert_in_delta 7.0, client.send(:retry_delay, r, 1), 0.001
