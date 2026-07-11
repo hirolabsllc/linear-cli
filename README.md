@@ -51,15 +51,27 @@ linear close  ENG-12 --comment "verified"        # → Done
 linear view   ENG-12                             # parent / sub-issues / relations + comment ids
 linear list   --status in_progress --team ENG
 
-linear comment        ENG-12 "QA passed"         # or: --body-file notes.md (avoids shell escaping)
+linear comment        ENG-12 "QA passed"         # or: --body-file notes.md / --body-file - (STDIN)
 linear comments       ENG-12                      # list comment ids
-linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md
+linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md / -
 linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comment
 ```
 
-Multi-line markdown with backticks/parens breaks under bash command substitution, so `create` accepts
-`--desc-file PATH` and `comment` / `comment-edit` accept `--body-file PATH` to read the body from a
-file. Unknown flags are rejected (a typo like `comment ENG-12 --show` errors instead of posting junk).
+Multi-line markdown with backticks/`$`/`\` breaks under bash command substitution when passed as a
+double-quoted arg, so `create` accepts `--desc-file PATH` and `comment` / `comment-edit` accept
+`--body-file PATH` to read the body from a file. For a **rich body without a temp file**, use
+`--body-file -` to read STDIN from a **single-quoted heredoc**, which suppresses all shell expansion so
+backticks / `$` / `\` reach Linear verbatim:
+
+```sh
+linear comment ENG-12 --body-file - <<'MD'
+## Heading — inline `code`, $VARS and C:\paths all survive
+MD
+```
+
+A positional body that itself starts with `--` (e.g. a `---` horizontal rule) can be passed after a
+POSIX `--` end-of-options separator: `linear comment ENG-12 -- "--- then the body"`. Unknown flags are
+still rejected (a typo like `comment ENG-12 --show` errors instead of posting junk).
 
 Every command except `create` / `list` takes an issue id (e.g. `ENG-12`) and resolves its team
 automatically — no `--team` needed. Run `linear` with no args for the full command list.

@@ -173,9 +173,16 @@ end
 # mistyped flag (the `comment ISSUE-N --show` typo that posted a stray no-op comment) is now rejected
 # instead of being swallowed as input.
 
-# Read a markdown body from a file (for --desc-file / --body-file). Re-tags as UTF-8 (file may be
-# ASCII-8BIT) so it joins cleanly with the UTF-8 markdown we build; `.scrub` keeps bad bytes non-fatal.
+# Read a markdown body from a file (for --desc-file / --body-file), or from STDIN when the path is "-".
+# The "-" / stdin form is the robust way to pass complex multi-line markdown: a caller pipes a
+# SINGLE-QUOTED heredoc (`--body-file - <<'MD' … MD`), which suppresses ALL shell expansion, so code
+# fences / backticks / `$VAR` / `\` reach the gem byte-for-byte instead of being mangled by bash
+# command substitution + variable expansion the way a double-quoted positional body is (AGT-201).
+# Re-tags as UTF-8 (file/STDIN bytes may be ASCII-8BIT) so it joins cleanly with the UTF-8 markdown we
+# build; `.scrub` keeps bad bytes non-fatal.
 def read_body_file(path)
+  return $stdin.read.to_s.force_encoding("UTF-8").scrub if path == "-"
+
   abort "Body file not found: #{path}" unless File.file?(path)
 
   File.read(path).force_encoding("UTF-8").scrub
@@ -317,8 +324,8 @@ end
 # Edit an existing comment's body by comment id. New body comes from the positional arg or --body-file
 # (the file form avoids shell-escaping multi-line markdown). The comment must belong to ISSUE-N.
 def cmd_comment_edit(args)
-  identifier = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH"
-  comment_id = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH"
+  identifier = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH|-"
+  comment_id = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH|-"
   body_file = nil
   positionals = []
   unknown = []
@@ -326,6 +333,8 @@ def cmd_comment_edit(args)
   while i < args.length
     case args[i]
     when "--body-file" then body_file = args[i + 1]; i += 2
+    # POSIX end-of-options: everything after `--` is the body (a `--`-leading body isn't a flag).
+    when "--"          then positionals.concat(args[(i + 1)..] || []); break
     when /\A--/        then unknown << args[i]; i += 1
     else positionals << args[i]; i += 1
     end
@@ -337,7 +346,7 @@ def cmd_comment_edit(args)
     abort "Pass either a body argument or --body-file, not both." if body
     body = read_body_file(body_file)
   end
-  abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH" if body.nil? || body.strip.empty?
+  abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH|-" if body.nil? || body.strip.empty?
 
   ensure_comment_on_issue!(identifier, comment_id)
   CLIENT.update_comment(comment_id, body)
@@ -475,7 +484,7 @@ def cmd_list(args)
 end
 
 def cmd_comment(args)
-  identifier = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH [--image PATH ...]"
+  identifier = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH|- [--image PATH ...]  (--body-file - reads STDIN)"
   images = []
   body_file = nil
   positionals = []
@@ -485,6 +494,9 @@ def cmd_comment(args)
     case args[i]
     when "--image"     then images << args[i + 1]; i += 2
     when "--body-file" then body_file = args[i + 1]; i += 2
+    # POSIX end-of-options: everything after a bare `--` is the body, so a positional that itself
+    # starts with `--` (e.g. a `---` horizontal rule) isn't misread as an unknown flag (AGT-201).
+    when "--"          then positionals.concat(args[(i + 1)..] || []); break
     when /\A--/        then unknown << args[i]; i += 1
     else positionals << args[i]; i += 1
     end
@@ -499,7 +511,7 @@ def cmd_comment(args)
     abort "Pass either a body argument or --body-file, not both." if body
     body = read_body_file(body_file)
   end
-  abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH [--image PATH ...]" if body.nil? || body.strip.empty?
+  abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH|- [--image PATH ...]  (--body-file - reads STDIN)" if body.nil? || body.strip.empty?
 
   body = join_md(body, images_markdown(images)) if images.any?
   CLIENT.comment(identifier, body)
@@ -712,32 +724,36 @@ def cmd_unrelate(args)
   puts "Removed #{count} relation(s) between #{a} and #{b}."
 end
 
-begin
-  command = ARGV.shift
+# Dispatch one CLI invocation. Wrapped in a method (rather than bare top-level code) with a guarded
+# autorun at the bottom so the file can be `load`ed in tests (LINEAR_CLI_SKIP_MAIN=1) to exercise the
+# cmd_* / read_body_file helpers WITHOUT running a command or hitting the network. The `bin/linear`
+# shim `load`s this file in production, where the env flag is unset, so `run(argv)` fires normally.
+def run(argv = ARGV)
+  command = argv.shift
   case command
-  when "create"  then cmd_create(ARGV)
-  when "view"    then cmd_view(ARGV)
-  when "url"     then cmd_url(ARGV)
-  when "retitle", "rename" then cmd_retitle(ARGV)
-  when "priority", "prio"   then cmd_priority(ARGV)
-  when "set"     then cmd_set(ARGV)
-  when "close"   then cmd_close(ARGV)
-  when "cancel"  then cmd_cancel(ARGV)
-  when "list"    then cmd_list(ARGV)
-  when "search"  then cmd_search(ARGV)
-  when "reopen"  then cmd_reopen(ARGV)
-  when "parent"  then cmd_parent(ARGV)
-  when "relate"  then cmd_relate(ARGV)
-  when "unrelate" then cmd_unrelate(ARGV)
-  when "comment" then cmd_comment(ARGV)
-  when "comments"        then cmd_comments(ARGV)
-  when "comment-edit"    then cmd_comment_edit(ARGV)
-  when "comment-delete"  then cmd_comment_delete(ARGV)
-  when "attach"  then cmd_attach(ARGV)
-  when "commit"  then cmd_commit(ARGV)
-  when "start"   then cmd_start(ARGV)
-  when "review"  then cmd_review(ARGV)
-  when "label"   then cmd_label(ARGV)
+  when "create"  then cmd_create(argv)
+  when "view"    then cmd_view(argv)
+  when "url"     then cmd_url(argv)
+  when "retitle", "rename" then cmd_retitle(argv)
+  when "priority", "prio"   then cmd_priority(argv)
+  when "set"     then cmd_set(argv)
+  when "close"   then cmd_close(argv)
+  when "cancel"  then cmd_cancel(argv)
+  when "list"    then cmd_list(argv)
+  when "search"  then cmd_search(argv)
+  when "reopen"  then cmd_reopen(argv)
+  when "parent"  then cmd_parent(argv)
+  when "relate"  then cmd_relate(argv)
+  when "unrelate" then cmd_unrelate(argv)
+  when "comment" then cmd_comment(argv)
+  when "comments"        then cmd_comments(argv)
+  when "comment-edit"    then cmd_comment_edit(argv)
+  when "comment-delete"  then cmd_comment_delete(argv)
+  when "attach"  then cmd_attach(argv)
+  when "commit"  then cmd_commit(argv)
+  when "start"   then cmd_start(argv)
+  when "review"  then cmd_review(argv)
+  when "label"   then cmd_label(argv)
   else
     puts <<~USAGE
       #{PROG} — Linear issue CLI (linear_cli gem; default team #{default_team || "(set $LINEAR_DEFAULT_TEAM or use --team)"})
@@ -747,7 +763,7 @@ begin
       issue id (e.g. ENG-123) and resolves its team automatically — no --team needed.
 
       Commands:
-        create  "Title" [--team KEY] [--label Bug|Feature|Infrastructure|Ops] [--priority urgent|high|medium|low] [--desc "body" | --desc-file PATH] [--image PATH ...]
+        create  "Title" [--team KEY] [--label Bug|Feature|Infrastructure|Ops] [--priority urgent|high|medium|low] [--desc "body" | --desc-file PATH|-] [--image PATH ...]
                 [--parent ISSUE-N] [--blocked-by ISSUE-N] [--blocks ISSUE-N] [--related ISSUE-N]   ← link deps AT create time
         search  "<keywords>" [--limit N]             full-text dedup search (ALL states; run BEFORE create)
         list    [--status todo|in_progress|done] [--label Bug] [--team KEY]
@@ -763,9 +779,11 @@ begin
         start   ISSUE-N [--session "session name"]     move to In Progress + log session attribution
         review  ISSUE-N [--sha <sha>]                  move to In Review + log merged SHA as a GitHub link
         commit  ISSUE-N [--sha <ref>] [--note "..."]   link a commit (clickable GitHub link + subject; default HEAD)
-        comment ISSUE-N "body" | --body-file PATH [--image PATH ...]   add a comment (QA result, notes, etc.)
+        comment ISSUE-N "body" | --body-file PATH|- [--image PATH ...]   add a comment (QA result, notes, etc.)
+                └─ rich multi-line markdown? use  --body-file -  with a SINGLE-quoted heredoc so the shell
+                   can't mangle backticks/$/\:   #{PROG} comment ISSUE-N --body-file - <<'MD' … MD
         comments        ISSUE-N                          list this issue's comments + their ids
-        comment-edit    ISSUE-N <comment-id> "new body" | --body-file PATH   edit a comment
+        comment-edit    ISSUE-N <comment-id> "new body" | --body-file PATH|-   edit a comment
         comment-delete  ISSUE-N <comment-id>            delete a comment (e.g. a stray/mistaken one)
         attach  ISSUE-N PATH [PATH ...] [--note "..."]  attach screenshot(s) — repro/QA evidence
         label   ISSUE-N <label>                         add a label (auto-creates it if missing)
@@ -806,3 +824,6 @@ rescue Linear::Client::Error => e
   warn "Linear error: #{e.message}"
   exit 1
 end
+
+# Autorun unless a test loaded us purely to reach the helpers (see the note on `run`).
+run(ARGV) unless ENV["LINEAR_CLI_SKIP_MAIN"] == "1"

@@ -449,6 +449,35 @@ class Linear::ClientTest < LinearCli::TestCase
     end
   end
 
+  # A rich comment body (headings / fenced code / backticks / `$` / `$()` / backslashes / quotes) must
+  # travel as an unescaped GraphQL *variable* — the client never interpolates it into the query, so
+  # Linear (not us) escapes it, and the exact JSON the transport serializes round-trips it byte-for-byte.
+  # This is the payload half of AGT-201; the CLI input half (STDIN / `--`) is in cli/comment_body_test.rb.
+  test "a comment body with code fences / backticks / $ / backslashes is sent as a variable and round-trips through JSON" do
+    nasty = <<~MD
+      ## Heading
+      ```ruby
+      say = `echo $(whoami)`
+      path = "C:\\a\\b"; nl = "\\n"
+      ```
+      - nested
+        - `--flag-ish`, $HOME and "quotes"
+    MD
+
+    captured = nil
+    ok = resp(code: 200, body: { "data" => { "commentCreate" => { "success" => true } } }.to_json)
+    client.stub(:perform_request, ->(_q, vars) { captured = vars; ok }) do
+      client.add_comment("issue-uuid", nasty)
+    end
+
+    # The client passes the body straight through as the `body` variable — no string interpolation.
+    assert_equal nasty, captured[:body]
+    # …and the exact wire JSON #perform_request builds (query + utf8-normalized variables) is valid and
+    # preserves the body verbatim — the property that makes rich markdown safe over the wire.
+    wire = JSON.generate({ query: "mutation { x }", variables: client.send(:utf8, captured) })
+    assert_equal nasty, JSON.parse(wire).dig("variables", "body")
+  end
+
   # --- priority + generic field setter (AGT-84) -----------------------------
 
   test "priority_int maps words strictly and rejects an unknown one" do

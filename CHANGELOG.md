@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.3.0] — 2026-07-11
+
+**Rich multi-line Markdown comment bodies — STDIN input + `--` end-of-options (AGT-201).** Filing a
+rich Linear comment via `bin/linear comment ISSUE-N "<body>"` mangled the body before the gem ever saw
+it: inside bash double quotes, code-fence/inline **backticks** run as command substitution, `$VAR` /
+`$(…)` expand, and `\` is eaten — so a body with headings + fenced code + `$`/`\` came out corrupted
+(and a body starting with `---` was rejected outright as a flag). The GraphQL layer was already correct
+(bodies travel as escaped **variables**, never string-interpolated into the query), so the fix is in
+how the CLI READS the body:
+
+- **`--body-file -` reads STDIN.** `read_body_file` now treats `-` as standard input, so a caller can
+  pipe a **single-quoted heredoc** — which suppresses ALL shell expansion — and the body reaches the
+  gem byte-for-byte:
+
+  ```sh
+  linear comment ISSUE-N --body-file - <<'MD'
+  ## Heading — inline `code`, $VARS, $(cmd) and C:\paths all survive verbatim
+  MD
+  ```
+
+  Shared by `comment`, `comment-edit`, and `create --desc-file`, so all three gain STDIN input.
+- **POSIX `--` end-of-options separator** on `comment` / `comment-edit`: everything after a bare `--`
+  is the body, so a positional body that itself starts with `--` (e.g. a `---` horizontal rule) is no
+  longer misread as an unknown flag. A genuine typo'd flag (`--show`) *before* `--` is still rejected —
+  the AGT-83 unknown-flag guard is preserved.
+- Usage/help updated to surface `--body-file -` (with the single-quoted-heredoc idiom) as the robust
+  path for complex bodies.
+- `exe/linear`'s command dispatch is wrapped in `run(argv)` with a guarded autorun
+  (`LINEAR_CLI_SKIP_MAIN=1`) so the CLI helpers are unit-testable without a network round-trip. New
+  `test/cli/comment_body_test.rb` (STDIN read / `--` separator / preserved typo-guard) plus a
+  client-level nasty-body → GraphQL-variable JSON round-trip test.
+
 ## [2.2.0] — 2026-06-18
 
 **`priority` command + a general field setter (AGT-84).** The CLI could edit only an issue's title
