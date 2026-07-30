@@ -395,6 +395,40 @@ module Linear
       { old_title: old_title, issue: data.dig("issueUpdate", "issue") }
     end
 
+    # --- description (AGT-216) -----------------------------------------------
+    # The counterpart to {#comment}. A ticket's DESCRIPTION is "now" — the current state, edited in
+    # place — while its comments are "how it got here". Before this, the CLI could only append: any
+    # agent asked to keep a ticket's body current had to post a comment instead, which makes the newest
+    # COMMENT the state of the world rather than the description. A board/status ticket rewrites its
+    # body every tick, so that contract was unimplementable.
+    #
+    # Replaces the whole description; posts NO comment as a side effect. `new_description` is the FINAL
+    # body string (same contract as {#create}'s `description` — the caller embeds any screenshot
+    # markdown). The previous body is returned because a replace is otherwise unrecoverable, so a host
+    # can report the delta or stash it. Returns { old_description:, issue: }.
+    #
+    # An empty/whitespace body is refused rather than silently clearing the description: it means a
+    # heredoc produced nothing or a --desc-file was empty, never "please blank this ticket". The guard
+    # lives HERE, not in the CLI, so every host (CLI + the admin HTTP endpoint) inherits it.
+    #
+    # NOTE — unlike a COMMENT body, a description does NOT round-trip byte-for-byte: Linear
+    # canonicalizes description markdown server-side (measured on AKA-1540: a `|---|` table separator
+    # comes back `| -- |`, a `-` bullet comes back `*`, a trailing newline is stripped). Content is
+    # untouched — backticks, `$(…)`, `$VAR`, backslashes and quotes all survive verbatim — so never
+    # verify a write by comparing bytes; the normalization is idempotent, so re-sending what you read
+    # back is stable.
+    def edit_description(identifier, new_description)
+      body = new_description.to_s
+      if body.strip.empty?
+        raise InvalidInput,
+              "Refusing to replace the description with an empty body — pass the new body via --desc/--desc-file"
+      end
+
+      issue   = find_issue!(identifier)
+      updated = update_issue(issue["id"], { description: body })
+      { old_description: issue["description"], issue: updated }
+    end
+
     # --- generic field setter + priority (AGT-84) ----------------------------
     # The ONE place a non-state/non-title field is changed. Before this, bumping a ticket's priority (or
     # assignee/estimate/due) meant dropping to a raw `issueUpdate` mutation, which defeats the shared

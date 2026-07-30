@@ -7,7 +7,7 @@ require "stringio"
 # become callable here without running a command or touching the network. (The `bin/linear` shim
 # `load`s the same file in production with the flag unset, so `run(ARGV)` fires there.)
 ENV["LINEAR_CLI_SKIP_MAIN"] = "1"
-load File.expand_path("../../exe/linear", __dir__)
+load File.expand_path("../../exe/linear", __dir__) unless defined?(PROG)
 
 # Regression tests for the CLI's comment-body INPUT layer (exe/linear) — the surface behind AGT-201:
 # a Claude session filing a rich Linear comment (`bin/linear comment ISSUE-N "<body>"`) with headings,

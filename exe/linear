@@ -15,6 +15,7 @@
 # Usage examples:
 #   linear search "<keywords>" [--limit N]
 #   linear create "Title" [--team KEY] [--label Bug|Feature|...] [--priority urgent|high|medium|low] [--desc "body"] ...
+#   linear edit ISSUE-N --desc-file board.md          # replace the description in place (no comment)
 #   linear start ISSUE-N --session "..."   |   linear review ISSUE-N --sha <sha>   |   linear close ISSUE-N
 
 require "net/http"
@@ -437,6 +438,35 @@ def cmd_set(args)
   puts res[:url]
 end
 
+# Replace an issue's DESCRIPTION in place — the counterpart to `comment` (AGT-216). The description is
+# the ticket's current state ("now"); comments are how it got here. Flags only, no positional body: a
+# whole-body replace is destructive, so it must be explicit. Rich markdown goes through `--desc-file -`
+# with a SINGLE-quoted heredoc, the same robust path `comment` uses. Prints the char delta so an
+# accidental clobber (3891 → 12) is visible; an empty body is refused by the client, not applied.
+def cmd_edit(args)
+  usage = "Usage: #{PROG} edit ISSUE-N --desc \"body\" | --desc-file PATH|-  (--desc-file - reads STDIN)"
+  identifier = args.shift or abort usage
+  description = nil
+  unknown = []
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--desc", "--description"           then description = args[i + 1]; i += 2
+    when "--desc-file", "--description-file" then description = read_body_file(args[i + 1]); i += 2
+    when /\A--/                              then unknown << args[i]; i += 1
+    else i += 1
+    end
+  end
+  reject_unknown_flags!(unknown, "edit")
+  abort usage if description.nil?
+
+  res     = CLIENT.edit_description(identifier, description)
+  updated = res[:issue]
+  puts "#{updated["identifier"]}: description replaced " \
+       "(#{res[:old_description].to_s.length} → #{description.length} chars)"
+  puts updated["url"]
+end
+
 def cmd_close(args)
   identifier = args.shift or abort "Usage: #{PROG} close ISSUE-N [--comment \"reason\"]"
   comment = nil
@@ -737,6 +767,7 @@ def run(argv = ARGV)
   when "retitle", "rename" then cmd_retitle(argv)
   when "priority", "prio"   then cmd_priority(argv)
   when "set"     then cmd_set(argv)
+  when "edit", "edit-desc" then cmd_edit(argv)
   when "close"   then cmd_close(argv)
   when "cancel"  then cmd_cancel(argv)
   when "list"    then cmd_list(argv)
@@ -772,6 +803,9 @@ def run(argv = ARGV)
         retitle ISSUE-N "New title"                     change an issue's title (alias: rename); prints old → new
         priority ISSUE-N urgent|high|medium|low|none    change priority (alias: prio); prints old → new
         set     ISSUE-N [--priority X] [--assignee me|email] [--estimate N] [--due YYYY-MM-DD] [--label NAME]   set field(s) in one call
+        edit    ISSUE-N --desc "body" | --desc-file PATH|-   REPLACE the description in place (posts NO comment)
+                └─ description = the current state ("now"); comments = how it got here. Rich markdown? use
+                   --desc-file -  with a SINGLE-quoted heredoc:  #{PROG} edit ISSUE-N --desc-file - <<'MD' … MD
         reopen  ISSUE-N [--in-progress] [--comment "why"]   move a Done/Canceled issue back (recurrence)
         parent  CHILD PARENT                  make CHILD a sub-issue of an epic (native hierarchy + rollup)
         relate  ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]   link two issues (real Linear relation)

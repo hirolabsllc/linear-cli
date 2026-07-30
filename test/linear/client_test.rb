@@ -531,6 +531,70 @@ class Linear::ClientTest < LinearCli::TestCase
     end
   end
 
+  # --- description replace (AGT-216) ----------------------------------------
+  # `edit_description` is the write half of "description = now, comments = how it got here". It rides
+  # the existing #update_issue mutation path (one new field, no new plumbing) and must never post a
+  # comment. The CLI input half (--desc / --desc-file / STDIN) is in cli/edit_desc_test.rb.
+
+  test "edit_description sends the body as a description on ONE issueUpdate and returns the old body" do
+    issue = { "id" => "i-1", "identifier" => "AGT-1", "url" => "u", "description" => "the old body" }
+    captured = nil
+    client.stub(:find_issue!, ->(_id) { issue }) do
+      client.stub(:update_issue, ->(_id, input) { captured = input; { "identifier" => "AGT-1", "url" => "u" } }) do
+        res = client.edit_description("AGT-1", "the new body")
+        assert_equal({ description: "the new body" }, captured, "only the description may change")
+        assert_equal "the old body", res[:old_description]
+        assert_equal "AGT-1", res[:issue]["identifier"]
+      end
+    end
+  end
+
+  test "edit_description never posts a comment" do
+    issue = { "id" => "i-1", "identifier" => "AGT-1", "url" => "u", "description" => "old" }
+    client.stub(:find_issue!, ->(_id) { issue }) do
+      client.stub(:update_issue, ->(_id, _input) { { "identifier" => "AGT-1", "url" => "u" } }) do
+        client.stub(:add_comment, ->(*_a) { flunk "edit_description must not post a comment" }) do
+          client.edit_description("AGT-1", "new")
+        end
+      end
+    end
+  end
+
+  # An empty body means a heredoc produced nothing or a --desc-file was empty — never "blank this
+  # ticket". Refused BEFORE the lookup, so no host (CLI or the admin endpoint) can clear a description
+  # by accident; a replace is otherwise unrecoverable.
+  test "edit_description refuses an empty or whitespace-only body before any network call" do
+    client.stub(:find_issue!, ->(_id) { flunk "must refuse an empty body before resolving the issue" }) do
+      ["", "   \n\t ", nil].each do |blank|
+        err = assert_raises(Linear::Client::InvalidInput) { client.edit_description("AGT-1", blank) }
+        assert_match(/empty body/, err.message)
+      end
+    end
+  end
+
+  # A rich board body (table + fenced code + backticks + `$()` + backslashes) must reach Linear as an
+  # unescaped GraphQL variable, exactly like a comment body does — the `/board` tick depends on it.
+  test "a description with code fences / backticks / $ / backslashes travels as a GraphQL variable" do
+    nasty = <<~MD
+      ## Board — now
+      ```ruby
+      say = `echo $(whoami)`
+      path = "C:\\a\\b"; nl = "\\n"
+      ```
+      - `--flag-ish`, $HOME and "quotes"
+    MD
+
+    captured = nil
+    ok = resp(code: 200, body: { "data" => { "issueUpdate" => { "success" => true, "issue" => { "identifier" => "AGT-1" } } } }.to_json)
+    client.stub(:perform_request, ->(_q, vars) { captured = vars; ok }) do
+      client.update_issue("i-1", { description: nasty })
+    end
+
+    assert_equal nasty, captured[:input][:description]
+    wire = JSON.generate({ query: "mutation { x }", variables: client.send(:utf8, captured) })
+    assert_equal nasty, JSON.parse(wire).dig("variables", "input", "description")
+  end
+
   test "set raises InvalidInput when no fields are given" do
     client.stub(:find_issue!, ->(_id) { flunk "must reject an empty set before any lookup" }) do
       assert_raises(Linear::Client::InvalidInput) { client.set("AGT-1") }

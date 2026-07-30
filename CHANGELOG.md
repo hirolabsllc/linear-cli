@@ -1,5 +1,48 @@
 # Changelog
 
+## [2.4.0] — 2026-07-30
+
+**`edit` — replace an issue's description in place (AGT-216).** The CLI could only ever APPEND to a
+ticket's body: `--desc` / `--desc-file` existed on `create` alone, `set` covered
+priority/assignee/estimate/due/label, and there was no `edit`. So an agent told to keep a ticket's
+description current had no way to do it and had to post a comment instead — which makes the newest
+COMMENT the state of the world rather than the description. That made the ticket contract's
+load-bearing rule — *description = now, edited in place; comments = how it got here* — unimplementable
+for **every** ticket, and blocked any board/status ticket that rewrites its body each tick.
+
+- **`linear edit ISSUE-N --desc "body" | --desc-file PATH|-`** replaces the whole description and
+  **posts no comment** as a side effect. `--description` / `--description-file` are accepted aliases,
+  and `edit-desc` is an alias for the command (disambiguating it from the existing `comment-edit`).
+  `--desc-file -` reads STDIN, so the AGT-201 single-quoted-heredoc idiom works here too — the robust
+  path for a body with code fences / backticks / `$VAR` / `\`:
+
+  ```sh
+  linear edit ISSUE-N --desc-file - <<'MD'
+  ## Now
+  | lane | wip | cap |
+  MD
+  ```
+- **Flags only — no positional body.** A whole-body replace is destructive, so it must be explicit;
+  there is no `edit ISSUE-N "body"` form to fat-finger.
+- **An empty or whitespace-only body is refused, not applied.** An empty body means a heredoc produced
+  nothing or a `--desc-file` was empty — never "blank this ticket". The guard lives in
+  `Linear::Client#edit_description`, so every host inherits it (the CLI *and* the admin HTTP endpoint),
+  and a description replace is otherwise unrecoverable.
+- The CLI prints the **char delta** (`description replaced (9070 → 359 chars)`) so an accidental
+  clobber is visible at a glance, and `#edit_description` returns the previous body
+  (`{ old_description:, issue: }`) so a host can report or stash it.
+- Implementation rides the existing `#update_issue` mutation path — one new field on
+  `IssueUpdateInput`, no new plumbing, and it inherits that method's success check.
+- **Gotcha, measured live:** unlike a comment body, a description does **not** round-trip
+  byte-for-byte — Linear canonicalizes description markdown server-side (`|---|` → `| -- |`, a `-`
+  bullet → `*`, trailing newline stripped). Content is untouched (backticks, `$(…)`, `$VAR`,
+  backslashes, quotes all survive verbatim) and the normalization is idempotent, so never verify a
+  write by comparing bytes.
+- New `test/cli/edit_desc_test.rb` (STDIN / inline / aliases / **no comment posted** / char delta /
+  usage + typo-flag guards) plus client-level tests for the single-field mutation, the empty-body
+  refusal, and the GraphQL-variable round trip. Both `cli/*_test.rb` files now `load exe/linear` only
+  when it isn't already loaded, so the suite no longer warns about re-initialized constants.
+
 ## [2.3.0] — 2026-07-11
 
 **Rich multi-line Markdown comment bodies — STDIN input + `--` end-of-options (AGT-201).** Filing a

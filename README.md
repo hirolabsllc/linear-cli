@@ -51,14 +51,24 @@ linear close  ENG-12 --comment "verified"        # → Done
 linear view   ENG-12                             # parent / sub-issues / relations + comment ids
 linear list   --status in_progress --team ENG
 
+linear edit   ENG-12 --desc-file board.md        # REPLACE the description in place (posts no comment)
+
 linear comment        ENG-12 "QA passed"         # or: --body-file notes.md / --body-file - (STDIN)
 linear comments       ENG-12                      # list comment ids
 linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md / -
 linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comment
 ```
 
+**`edit` vs `comment`** — an issue's *description* is **now** (the current state, rewritten in place);
+its *comments* are **how it got here**. `edit` replaces the whole description and never posts a
+comment, so a board/status ticket can keep its body current instead of burying the state in the newest
+comment. It takes flags only (no positional body — a whole-body replace is destructive, so it must be
+explicit) and refuses an empty body rather than blanking the ticket. Note that Linear canonicalizes
+description markdown server-side (`|---|` → `| -- |`, `-` bullets → `*`), so don't verify a write by
+byte-comparing what you sent; the content itself is preserved verbatim.
+
 Multi-line markdown with backticks/`$`/`\` breaks under bash command substitution when passed as a
-double-quoted arg, so `create` accepts `--desc-file PATH` and `comment` / `comment-edit` accept
+double-quoted arg, so `create` / `edit` accept `--desc-file PATH` and `comment` / `comment-edit` accept
 `--body-file PATH` to read the body from a file. For a **rich body without a temp file**, use
 `--body-file -` to read STDIN from a **single-quoted heredoc**, which suppresses all shell expansion so
 backticks / `$` / `\` reach Linear verbatim:
