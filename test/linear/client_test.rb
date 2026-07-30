@@ -572,6 +572,57 @@ class Linear::ClientTest < LinearCli::TestCase
     end
   end
 
+  # --- dropped embedded images (AGT-219) -------------------------------------
+  # `create --image` embeds each uploaded screenshot in the DESCRIPTION (there is no attachment field),
+  # so a whole-body replace can delete a bug's only repro image with nothing to show for it but a
+  # smaller char delta — silently defeating the evidence rule (AGT-66). edit_description reports the
+  # loss so every host can surface it; it must NOT block or re-append (a whole-body replace is the
+  # command's contract, and it stays non-interactive for an unattended board tick). Rendering is the
+  # CLI's job — see the stderr-warning cases in cli/edit_desc_test.rb.
+  ASSET_A = "https://uploads.linear.app/o-1/i-1/aaaa"
+  ASSET_B = "https://uploads.linear.app/o-1/i-2/bbbb"
+
+  def dropped_images(old_body, new_body)
+    issue = { "id" => "i-1", "identifier" => "AGT-1", "url" => "u", "description" => old_body }
+    client.stub(:find_issue!, ->(_id) { issue }) do
+      client.stub(:update_issue, ->(_id, _input) { { "identifier" => "AGT-1", "url" => "u" } }) do
+        client.edit_description("AGT-1", new_body)[:dropped_images]
+      end
+    end
+  end
+
+  test "edit_description reports the image refs the new body no longer carries" do
+    assert_equal [ASSET_A, ASSET_B],
+                 dropped_images("**Screenshots**\n\n![a](#{ASSET_A})\n\n![b](#{ASSET_B})", "rewritten, no images")
+  end
+
+  test "edit_description reports nothing dropped when the new body keeps the images" do
+    assert_empty dropped_images("old\n\n![a](#{ASSET_A})", "rewritten\n\n![a](#{ASSET_A})")
+    assert_empty dropped_images("no images here", "still none")
+  end
+
+  # The partial case a coarse "old had images, new has none" check would miss.
+  test "edit_description reports only the dropped image, not the one still embedded" do
+    assert_equal [ASSET_A], dropped_images("![a](#{ASSET_A})\n![b](#{ASSET_B})", "kept:\n\n![b](#{ASSET_B})")
+  end
+
+  test "image_refs collects markdown images and bare Linear upload URLs, deduped" do
+    md = <<~MD
+      ## Repro
+      ![shot.png](#{ASSET_A})
+      ![ext.png](https://example.test/x.png "with a markdown title")
+      raw log linked, not embedded: [server.log](#{ASSET_B})
+      the same shot again: ![shot.png](#{ASSET_A})
+    MD
+
+    assert_equal [ASSET_A, "https://example.test/x.png", ASSET_B], Linear::Client.image_refs(md)
+  end
+
+  test "image_refs is empty for a body with no image or upload reference" do
+    assert_empty Linear::Client.image_refs("prose with a (paren) and a plain [link](https://example.test)")
+    assert_empty Linear::Client.image_refs(nil)
+  end
+
   # A rich board body (table + fenced code + backticks + `$()` + backslashes) must reach Linear as an
   # unescaped GraphQL variable, exactly like a comment body does — the `/board` tick depends on it.
   test "a description with code fences / backticks / $ / backslashes travels as a GraphQL variable" do

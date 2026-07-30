@@ -67,6 +67,13 @@ explicit) and refuses an empty body rather than blanking the ticket. Note that L
 description markdown server-side (`|---|` → `| -- |`, `-` bullets → `*`), so don't verify a write by
 byte-comparing what you sent; the content itself is preserved verbatim.
 
+**`edit` warns when a replace drops a screenshot.** `create --image` embeds each uploaded screenshot in
+the *description* (there is no separate attachment field), so replacing the whole body can delete a
+ticket's only repro image. When the new body no longer references an image the old one did, `edit` prints
+`! dropped N embedded image(s)` to **stderr** and lists the asset URLs — which are still live, so you can
+re-embed one as `![name](url)` without re-uploading, or add fresh evidence with `linear attach`. It warns
+rather than blocks: a whole-body replace is the command's contract, and `edit` stays non-interactive.
+
 Multi-line markdown with backticks/`$`/`\` breaks under bash command substitution when passed as a
 double-quoted arg, so `create` / `edit` accept `--desc-file PATH` and `comment` / `comment-edit` accept
 `--body-file PATH` to read the body from a file. For a **rich body without a temp file**, use

@@ -1,5 +1,50 @@
 # Changelog
 
+## [2.5.0] — 2026-07-30
+
+**`edit` now says when a description replace deleted a screenshot (AGT-219).** A ticket's screenshots
+live INSIDE its description — `create --image` uploads each one and embeds `![name](assetUrl)` in the
+body, because Linear has no separate attachment field the CLI writes to. So the `edit` command added in
+2.4.0 could silently delete a bug's only repro image: it replaces the whole body, and the loss showed up
+as nothing but a smaller char delta. That quietly defeats the evidence rule the images are there for
+(AGT-66 — report, repro and QA screenshots belong ON the ticket, enforced on `create`/`comment` by a
+host-side pre-tool hook that correctly does *not* guard `edit`).
+
+- **`edit` prints a stderr warning naming each dropped image** when the new body no longer references an
+  image the old one did:
+
+  ```
+  AGT-219: description replaced (183 → 42 chars)
+    ! dropped 2 embedded image(s) — the replaced description carried screenshots this body does not (AGT-66: evidence belongs on the ticket)
+      - https://uploads.linear.app/…
+      - https://uploads.linear.app/…
+      those asset URLs are still live — re-embed as ![name](url) in the new body, or add fresh evidence with: linear attach AGT-219 PATH
+  ```
+
+  The listed URLs are the recovery path: the asset stays hosted after the description stops referencing
+  it, so re-embedding needs no re-upload.
+- **Warn, don't block — deliberately.** A whole-body replace *is* `edit`'s contract, so the fix makes the
+  loss legible rather than impossible. It does not raise, does not prompt, does not re-append the old
+  `**Screenshots**` block (magic, and wrong when the caller means to replace everything), and it still
+  applies the replace in full — `edit` has to stay non-interactive because a board/status ticket's tick
+  calls it unattended.
+- **Per-reference diff, not "old had images, new has none".** Dropping 2 of 3 screenshots warns about
+  exactly those 2 and stays quiet about the one still embedded — the coarse check misses that case
+  entirely and can't honestly report a count.
+- `Linear::Client#edit_description` returns the new **`dropped_images:`** key (alongside
+  `old_description:` / `issue:`), computed from the body it already fetched — **no extra network call**.
+  Detection lives in the client so every host inherits the fact (the CLI *and* the admin HTTP endpoint);
+  rendering it to stderr is the CLI's job.
+- New public **`Linear::Client.image_refs(markdown)`** → the deduped list of image references in a body:
+  every markdown image `![alt](url)` plus any bare `https://uploads.linear.app/…` URL (an uploaded file
+  linked rather than embedded — also evidence). Pure string work, so two bodies can be diffed offline.
+- Warning goes to **stderr**, so stdout stays parseable; stdout is flushed first so the warning can't
+  surface above the `description replaced` line it annotates when the output is piped.
+- Tests: 5 CLI cases in `test/cli/edit_desc_test.rb` (warns + names each URL · silent when neither body
+  has images · silent when the new body keeps them · partial-loss counts only what was dropped · the
+  warning neither blocks the replace nor prompts) driving the **real** `#edit_description` with only its
+  two network calls stubbed, plus 5 client cases for the diff and `image_refs` itself.
+
 ## [2.4.0] — 2026-07-30
 
 **`edit` — replace an issue's description in place (AGT-216).** The CLI could only ever APPEND to a

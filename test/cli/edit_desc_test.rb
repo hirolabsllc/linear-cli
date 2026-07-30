@@ -89,6 +89,79 @@ class CliEditDescTest < LinearCli::TestCase
     assert_match(/3891 → 4 chars/, out)
   end
 
+  # --- dropped embedded images (AGT-219) --------------------------------------
+  # Screenshots live INSIDE the description (`create --image` uploads each one and embeds the markdown
+  # in the body — there is no attachment field), so a whole-body replace can delete a bug's only repro
+  # image and show nothing but a smaller char delta. That silently defeats the evidence rule (AGT-66).
+  # The fix makes the loss LEGIBLE, not impossible: a stderr warning, no block and no prompt, because a
+  # whole-body replace IS `edit`'s contract and the board tick calls it unattended every tick.
+  ASSET_A = "https://uploads.linear.app/42cd419e-bca5/33d5c7bf-b097/8ef5693d-69bf"
+  ASSET_B = "https://uploads.linear.app/42cd419e-bca5/bcfb37a8-d4ce/e89e5270-1a6d"
+  ASSET_C = "https://uploads.linear.app/42cd419e-bca5/cc7f1a02-91de/3b1d0c44-77aa"
+
+  # Drive cmd_edit through the REAL Linear::Client#edit_description with only its two network calls
+  # stubbed, so these cases exercise the actual detect → report seam rather than a hand-fed list.
+  # Returns capture_io's [stdout, stderr].
+  def edit_io(old_body, new_body, identifier: "ISSUE-1")
+    issue = { "id" => "i-1", "identifier" => identifier, "url" => "u", "description" => old_body }
+    CLIENT.stub(:find_issue!, ->(_id) { issue }) do
+      CLIENT.stub(:update_issue, ->(_id, _input) { { "identifier" => identifier, "url" => "u" } }) do
+        capture_io { cmd_edit([identifier, "--desc", new_body]) }
+      end
+    end
+  end
+
+  test "edit warns on stderr and names each dropped asset URL when the new body loses the screenshots" do
+    out, err = edit_io("Repro:\n\n**Screenshots**\n\n![a.png](#{ASSET_A})\n\n![b.png](#{ASSET_B})",
+                       "## Now\n\nrewritten body, no images")
+
+    assert_match(/dropped 2 embedded image\(s\)/, err)
+    assert_includes err, ASSET_A
+    assert_includes err, ASSET_B
+    # The recovery path: the assets are still hosted, so the old URL can be re-embedded as-is.
+    assert_match(/still live/, err)
+    assert_match(/attach ISSUE-1 PATH/, err, "should point at the command that adds fresh evidence")
+    refute_match(/dropped/, out, "the warning belongs on stderr — stdout stays parseable")
+    assert_match(/description replaced/, out)
+  end
+
+  test "edit is silent when neither the old nor the new description carries an image" do
+    _out, err = edit_io("plain old body", "plain new body")
+    assert_empty err
+  end
+
+  test "edit is silent when the new body keeps the same embedded images" do
+    _out, err = edit_io("old\n\n![a.png](#{ASSET_A})", "## Now\n\nrewritten\n\n![a.png](#{ASSET_A})")
+    assert_empty err
+  end
+
+  # A partial loss is the case a coarse "old had images, new has none" check misses entirely.
+  test "edit warns about only the images actually dropped, not every image in the old body" do
+    _out, err = edit_io("![a](#{ASSET_A})\n![b](#{ASSET_B})\n![c](#{ASSET_C})",
+                        "kept one:\n\n![b](#{ASSET_B})")
+
+    assert_match(/dropped 2 embedded image\(s\)/, err)
+    assert_includes err, ASSET_A
+    assert_includes err, ASSET_C
+    refute_includes err, ASSET_B, "the image the new body still carries was not dropped"
+  end
+
+  # The load-bearing property: warning ≠ blocking. `edit` must remain non-interactive and still apply
+  # the replace, or the unattended board tick breaks.
+  test "the dropped-image warning neither blocks the replace nor prompts" do
+    captured = nil
+    issue = { "id" => "i-1", "identifier" => "ISSUE-1", "url" => "u", "description" => "![a](#{ASSET_A})" }
+    CLIENT.stub(:find_issue!, ->(_id) { issue }) do
+      CLIENT.stub(:update_issue, ->(_id, input) { captured = input; { "identifier" => "ISSUE-1", "url" => "u" } }) do
+        with_stdin(StringIO.new("")) do   # any read from STDIN would hit EOF, not a prompt
+          _out, err = capture_io { cmd_edit(["ISSUE-1", "--desc", "no images now"]) }
+          assert_match(/dropped 1 embedded image\(s\)/, err)
+        end
+      end
+    end
+    assert_equal({ description: "no images now" }, captured, "the replace must still be applied in full")
+  end
+
   test "edit aborts with usage when neither --desc nor --desc-file is given" do
     CLIENT.stub(:edit_description, ->(*_a) { flunk "must not call the client with no body" }) do
       assert_raises(SystemExit) { capture_io { cmd_edit(["ISSUE-1"]) } }

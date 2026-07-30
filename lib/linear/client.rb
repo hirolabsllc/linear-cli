@@ -417,6 +417,13 @@ module Linear
     # untouched — backticks, `$(…)`, `$VAR`, backslashes and quotes all survive verbatim — so never
     # verify a write by comparing bytes; the normalization is idempotent, so re-sending what you read
     # back is stable.
+    #
+    # `dropped_images:` (AGT-219) names the image references the new body no longer carries — see
+    # {.image_refs}. A replace that deletes a ticket's only repro screenshot is otherwise INVISIBLE
+    # (there is no attachment field: `create --image` embeds the markdown in the description itself),
+    # which collides head-on with the "screenshots belong on the ticket" evidence rule (AGT-66). It is
+    # reported, NOT prevented: this method must not block or silently re-append, because a whole-body
+    # replace IS `edit`'s contract and it has to stay non-interactive (a board tick calls it unattended).
     def edit_description(identifier, new_description)
       body = new_description.to_s
       if body.strip.empty?
@@ -425,8 +432,28 @@ module Linear
       end
 
       issue   = find_issue!(identifier)
+      old     = issue["description"]
       updated = update_issue(issue["id"], { description: body })
-      { old_description: issue["description"], issue: updated }
+      { old_description: old, issue: updated,
+        dropped_images: self.class.image_refs(old) - self.class.image_refs(body) }
+    end
+
+    # --- embedded-image references (AGT-219) ---------------------------------
+    # A markdown image `![alt](url)` — how `create --image` / `attach` embed an uploaded screenshot —
+    # plus any bare Linear-hosted upload URL (an uploaded file *linked* rather than embedded). Both
+    # forms are evidence, so both count. Returns the deduped URL list; a markdown image whose URL is a
+    # Linear asset matches both patterns and collapses to one entry.
+    #
+    # Pure string work, so a caller can diff two bodies with no extra network round-trip (which is what
+    # {#edit_description} does). The image regexp stops at `)` or whitespace so an optional markdown
+    # title (`![a](url "title")`) doesn't end up in the URL; the asset regexp stops before the closing
+    # bracket/quote characters that would trail a URL inside a link.
+    IMAGE_MARKDOWN_RE   = /!\[[^\]]*\]\(\s*([^)\s]+)/
+    LINEAR_ASSET_URL_RE = %r{https://uploads\.linear\.app[^\s)\]"'<>]+}
+
+    def self.image_refs(markdown)
+      text = markdown.to_s
+      (text.scan(IMAGE_MARKDOWN_RE).flatten + text.scan(LINEAR_ASSET_URL_RE)).uniq
     end
 
     # --- generic field setter + priority (AGT-84) ----------------------------

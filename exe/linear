@@ -465,6 +465,27 @@ def cmd_edit(args)
   puts "#{updated["identifier"]}: description replaced " \
        "(#{res[:old_description].to_s.length} → #{description.length} chars)"
   puts updated["url"]
+  warn_dropped_images(updated["identifier"], res[:dropped_images])
+end
+
+# Screenshots live INSIDE the description — `create --image` uploads each one and embeds the markdown in
+# the body (there is no separate attachment field) — so a whole-body replace can delete a ticket's only
+# repro image with nothing but a smaller char delta to show for it. That silently defeats the evidence
+# rule (AGT-66: report, repro and QA screenshots belong ON the ticket). We WARN rather than block or
+# re-append: replacing the whole body IS `edit`'s contract, and `edit` must stay non-interactive because
+# a board tick calls it unattended. Goes to stderr so stdout stays parseable. (AGT-219)
+def warn_dropped_images(identifier, dropped)
+  dropped = Array(dropped)
+  return if dropped.empty?
+
+  # stdout is block-buffered when piped while stderr is not, so flush first or the warning surfaces
+  # ABOVE the "description replaced" line it annotates.
+  $stdout.flush
+  warn "  ! dropped #{dropped.size} embedded image(s) — the replaced description carried screenshots " \
+       "this body does not (AGT-66: evidence belongs on the ticket)"
+  dropped.each { |url| warn "    - #{url}" }
+  warn "    those asset URLs are still live — re-embed as ![name](url) in the new body, " \
+       "or add fresh evidence with: #{PROG} attach #{identifier} PATH"
 end
 
 def cmd_close(args)
