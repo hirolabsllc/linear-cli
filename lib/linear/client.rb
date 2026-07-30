@@ -574,20 +574,47 @@ module Linear
     # un-removable from the CLI. These surface Linear's commentUpdate / commentDelete (and a way to
     # discover comment ids), so a mistaken comment can be edited or deleted.
 
-    # List an issue's comments oldest-first (the order Linear returns), each node
-    # { "id", "body", "createdAt", "user" => { "name" } }. Used to discover the id to edit/delete.
+    # Maximum `first:` Linear accepts on a connection — 251 is an "Argument Validation Error" (measured
+    # 2026-07-30). {#comments} asks for the whole page rather than letting Linear default to 50, because
+    # a truncated window silently breaks the oldest-first contract below: sorting the newest 50 ascending
+    # would make `.first` mean "50th-newest", which is the same species of silently-wrong answer as the
+    # ordering bug itself (AGT-217).
+    MAX_PAGE_SIZE = 250
+
+    # List an issue's comments **oldest-first** — `.first` is the oldest comment, `.last` is the newest —
+    # each node { "id", "body", "createdAt", "user" => { "name" } }. Used to discover the id to
+    # edit/delete, and to read a thread in the order it happened.
     # Raises NotFound when the issue identifier doesn't resolve.
+    #
+    # The ascending sort is ours, and it is NOT cosmetic (AGT-217). Linear returns comments **newest**
+    # first, so this method used to hand back the reverse of what its own doc promised: `.last` returned
+    # the OLDEST comment. Nothing raised — a caller asking "is my comment the most recent" just quietly
+    # read a stale sibling. That is not hypothetical: it misreported a digest timestamp during the
+    # AGT-216 verification, reading a 36-minute-old comment as the newest one.
+    #
+    # Two halves, because Linear's API can only give us one of them:
+    #   * `orderBy: createdAt` pins the sort *field*. It does NOT make the result ascending —
+    #     `PaginationOrderBy` offers only `createdAt`/`updatedAt` and no direction (a `PaginationSortOrder`
+    #     enum exists in the schema but is not an argument on this connection), so both values return
+    #     descending. We pass it anyway so that editing an old comment can't reshuffle the list, which is
+    #     what an implicit `updatedAt` default would do.
+    #   * the `sort_by` supplies the direction the API won't. It sorts on the timestamp rather than
+    #     `.reverse`-ing the response, so the contract holds even if Linear's default direction changes —
+    #     relying on that implicit default is precisely what let the doc and the behaviour drift apart
+    #     unnoticed. `id` breaks ties so the order is deterministic (Ruby's `sort_by` is not stable) when
+    #     two comments share a `createdAt`.
     def comments(identifier)
-      data = graphql(<<~GQL, { id: identifier })
-        query($id: String!) {
+      data = graphql(<<~GQL, { id: identifier, first: MAX_PAGE_SIZE })
+        query($id: String!, $first: Int!) {
           issue(id: $id) {
-            comments { nodes { id body createdAt user { name } } }
+            comments(first: $first, orderBy: createdAt) { nodes { id body createdAt user { name } } }
           }
         }
       GQL
       raise NotFound, "Issue #{identifier} not found" if data["issue"].nil?
 
-      data.dig("issue", "comments", "nodes") || []
+      nodes = data.dig("issue", "comments", "nodes") || []
+      nodes.sort_by { |c| [c["createdAt"].to_s, c["id"].to_s] }
     end
 
     # Edit a comment's body by comment id. Returns the updated comment node { "id", "body" }.

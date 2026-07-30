@@ -400,14 +400,69 @@ class Linear::ClientTest < LinearCli::TestCase
 
   # --- comment list / edit / delete (AGT-83) --------------------------------
 
-  test "comments returns the issue's comment nodes" do
-    payload = { "issue" => { "comments" => { "nodes" => [
-      { "id" => "c1", "body" => "first",  "createdAt" => "t1", "user" => { "name" => "A" } },
-      { "id" => "c2", "body" => "second", "createdAt" => "t2", "user" => { "name" => "B" } }
-    ] } } }
-    client.stub(:graphql, ->(*_a) { payload }) do
-      assert_equal %w[c1 c2], client.comments("AGT-1").map { |n| n["id"] }
+  # Linear hands back comments NEWEST-first. Every fixture below is therefore in that order — feeding
+  # them already-ascending (as the original test did) is exactly why the doc could promise oldest-first
+  # for two releases while the method returned the reverse, with nothing to catch it (AGT-217).
+  NEWEST_FIRST_COMMENTS = [
+    { "id" => "c4", "body" => "newest", "createdAt" => "2026-07-30T11:48:52.115Z", "user" => { "name" => "D" } },
+    { "id" => "c3", "body" => "third",  "createdAt" => "2026-07-30T11:43:33.499Z", "user" => { "name" => "C" } },
+    { "id" => "c2", "body" => "second", "createdAt" => "2026-07-30T11:14:24.932Z", "user" => { "name" => "B" } },
+    { "id" => "c1", "body" => "oldest", "createdAt" => "2026-07-30T11:12:52.972Z", "user" => { "name" => "A" } }
+  ].freeze
+
+  def newest_first_payload = { "issue" => { "comments" => { "nodes" => NEWEST_FIRST_COMMENTS.map(&:dup) } } }
+
+  test "comments returns the issue's comment nodes oldest-first, reversing what Linear sends" do
+    client.stub(:graphql, ->(*_a) { newest_first_payload }) do
+      assert_equal %w[c1 c2 c3 c4], client.comments("AGT-1").map { |n| n["id"] },
+                   "comments must be oldest-first regardless of the order Linear returns"
     end
+  end
+
+  # The whole point of the sort: `.last` is the natural way to ask "what did the most recent comment
+  # say", and it used to answer with the OLDEST one — silently, no error. A check asserting "the newest
+  # comment is the digest I just posted" read a 36-minute-old sibling instead (AGT-217).
+  test "comments .last is the newest comment and .first is the oldest" do
+    client.stub(:graphql, ->(*_a) { newest_first_payload }) do
+      list = client.comments("AGT-1")
+      assert_equal "c4", list.last["id"],  ".last must be the NEWEST comment"
+      assert_equal "c1", list.first["id"], ".first must be the OLDEST comment"
+    end
+  end
+
+  # Guards the direction against Linear's default flipping: sorting on the timestamp (rather than
+  # `.reverse`-ing the response) has to hold for ANY order the server returns.
+  test "comments sorts oldest-first even when Linear returns them shuffled" do
+    shuffled = { "issue" => { "comments" => { "nodes" => NEWEST_FIRST_COMMENTS.values_at(2, 0, 3, 1).map(&:dup) } } }
+    client.stub(:graphql, ->(*_a) { shuffled }) do
+      assert_equal %w[c1 c2 c3 c4], client.comments("AGT-1").map { |n| n["id"] }
+    end
+  end
+
+  # Ruby's sort_by is not stable, so identical timestamps must fall back to a deterministic key or the
+  # order becomes implementation-defined — the same "works until it doesn't" trap as the original bug.
+  test "comments breaks createdAt ties deterministically by id" do
+    same_time = [
+      { "id" => "cb", "body" => "b", "createdAt" => "2026-07-30T11:00:00.000Z", "user" => { "name" => "B" } },
+      { "id" => "ca", "body" => "a", "createdAt" => "2026-07-30T11:00:00.000Z", "user" => { "name" => "A" } }
+    ]
+    client.stub(:graphql, ->(*_a) { { "issue" => { "comments" => { "nodes" => same_time } } } }) do
+      assert_equal %w[ca cb], client.comments("AGT-1").map { |n| n["id"] }
+    end
+  end
+
+  # Pins the two things the query must ask for. `orderBy: createdAt` keeps the sort FIELD from being an
+  # implicit default (an `updatedAt` default would reshuffle the list whenever an old comment is edited);
+  # the full page size keeps the ascending sort honest — over a truncated newest-50 window `.first` would
+  # silently mean "50th-newest" rather than "oldest".
+  test "comments asks Linear to order by createdAt over a full page" do
+    captured = nil
+    client.stub(:graphql, ->(q, vars) { captured = [q, vars]; newest_first_payload }) do
+      client.comments("AGT-1")
+    end
+    assert_includes captured[0], "orderBy: createdAt", "the sort field must be explicit, not Linear's default"
+    assert_equal Linear::Client::MAX_PAGE_SIZE, captured[1][:first]
+    assert_operator Linear::Client::MAX_PAGE_SIZE, :<=, 250, "251 is an Argument Validation Error at Linear"
   end
 
   test "comments returns an empty array for an issue with no comments" do

@@ -1,5 +1,38 @@
 # Changelog
 
+## [2.6.0] — 2026-07-30
+
+**`Linear::Client#comments` returned the reverse of what it documented (AGT-217).** The method promised
+"oldest-first (the order Linear returns)" and returned **newest-first** — so `.last`, the natural way to
+ask *what did the most recent comment say*, handed back the **oldest** comment. Nothing raised and
+nothing looked wrong; a caller checking "is my comment the most recent one" just silently read a stale
+sibling. It bit the 2.5.0/AGT-216 verification directly: a check asserting the newest comment was the
+digest it had just posted read a **36-minute-old** comment and reported the wrong timestamp. Both halves
+of the drift were unguarded — no test asserted ordering, which is exactly how the doc and the behaviour
+could disagree for two releases unnoticed.
+
+- **`comments` now really is oldest-first** — `.first` is the oldest comment, `.last` is the newest, and
+  `linear comments ISSUE-N` / `linear view ISSUE-N` print threads in the order they happened.
+- **The direction is sorted client-side, because Linear's API cannot express it.** `PaginationOrderBy`
+  offers only `createdAt` / `updatedAt` and no direction — a `PaginationSortOrder` enum exists in the
+  schema but is not an argument on the `comments` connection, and both `orderBy` values return
+  descending (measured 2026-07-30). The query still passes **`orderBy: createdAt` explicitly** to pin the
+  sort *field*, so editing an old comment can't reshuffle the list the way an implicit `updatedAt`
+  default would; the sort supplies the direction. It sorts on the timestamp rather than `.reverse`-ing
+  the response, so the contract holds whatever order the server returns — relying on that implicit
+  default is what let doc and behaviour drift apart in the first place. Ties break on `id`, since Ruby's
+  `sort_by` is not stable.
+- **The query now asks for a full 250-comment page** (Linear's maximum — 251 is an *Argument Validation
+  Error*) instead of letting Linear default to 50. Sorting a truncated **newest-50** window ascending
+  would make `.first` silently mean "50th-newest" rather than "oldest" — the same species of
+  quietly-wrong answer as the bug being fixed. `Linear::Client::MAX_PAGE_SIZE` is public.
+- **Five tests pin the ordering**, all of which fail against the previous behaviour: the fixtures are
+  newest-first (the order Linear actually sends) rather than pre-sorted, which is the flaw that let the
+  original tests pass while the contract was inverted.
+- No caller inverted: the two display paths (`comments`, `view`) read better oldest-first, the
+  `comment-edit` / `comment-delete` guard matches by id, and `comment-edit` / `comment-delete` take an
+  explicit comment id. No consumer in the host app calls `#comments`.
+
 ## [2.5.0] — 2026-07-30
 
 **`edit` now says when a description replace deleted a screenshot (AGT-219).** A ticket's screenshots
