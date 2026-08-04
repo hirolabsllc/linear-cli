@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.8.1] — 2026-08-04
+
+**The stale-checkout warning offered bundler a remedy bundler would undo (AGT-222).** Found while
+dogfooding v2.8.0 across all four surfaces. A `Gemfile` pinned by tag produces a bundler checkout that
+*does* carry the repo's tags — the v2.8.0 assumption that such a copy is tagless held for one bundle
+layout and not the other — so a trader-ai pin left a release behind would correctly be reported as
+stale, and then told to `cd` into `…/bundler/gems/linear-cli-<sha>` and `git checkout` the new tag.
+That directory is bundler's: it re-clones it from `Gemfile.lock`, so the next `bundle install` undoes
+the checkout and the lock disagrees with the tree in the meantime. A remedy the managing tool will
+clobber is worse than no remedy.
+
+- **A bundler-managed checkout is now told to bump the pin** — "bump the linear_cli tag to vX.Y.Z in
+  your Gemfile, then `bundle update linear_cli`" — recognised by bundler's documented install layout
+  (`…/bundler/gems/<name>-<shortsha>`). The staleness is still reported, because a lagging pin is
+  exactly surface 1's drift; only the fix line changes.
+- No change to the other shapes: a detached HEAD is still told to move the pin to the new tag, a branch
+  checkout to fast-forward.
+
 ## [2.8.0] — 2026-08-04
 
 **A gem tag reaches FOUR checkouts, and a stale one said nothing (AGT-222).** Tagging this gem ships it
@@ -30,12 +48,15 @@ the one surface neither covered.
   no credentials, nothing that can hang. It therefore cannot see a tag a checkout has never fetched;
   that is closed from the other end by the release recipe, which fast-forwards the plain clone in the
   same breath as `git push`. A cached `git ls-remote` would close it for a box nobody fetches (AGT-220).
-- **Deliberately silent where a warning would be noise.** A packaged `gem install` has no `.git`; a
-  bundler-vendored checkout has no tags (heads-only refspec) and a permanently modified
-  `linear_cli.gemspec` that bundler rewrites in place — there the `Gemfile` pin defines the version, and
-  crying wolf on every `bin/linear` in trader-ai would train the eye past the one line that matters.
-  Linked worktrees are exempt from the dirty half, since uncommitted work is a dev worktree's normal
-  state. `LINEAR_CLI_SKIP_CHECKOUT_CHECK=1` opts out entirely.
+- **Deliberately silent where a warning would be noise, and never misdirecting.** A packaged
+  `gem install` has no `.git`, and a checkout with no release tags has nothing to be measured against.
+  Bundler's vendored copy carries a permanently modified `linear_cli.gemspec` (bundler rewrites it in
+  place), which is why only `lib/`/`exe/` count as dirty — crying wolf on every `bin/linear` in
+  trader-ai would train the eye past the one line that matters. When a `Gemfile` pin genuinely is
+  behind, the remedy offered is to bump the pin and `bundle update`, never a `git checkout` inside a
+  directory bundler re-clones from `Gemfile.lock`. Linked worktrees are exempt from the dirty half,
+  since uncommitted work is a dev worktree's normal state.
+  `LINEAR_CLI_SKIP_CHECKOUT_CHECK=1` opts out entirely.
 - **All four surfaces are now documented in one place** — README, "Releasing — a tag does not ship
   itself", with the propagation command for each. trader-ai's and cerails' own rules point at it.
 

@@ -38,11 +38,19 @@ module LinearCli
     SKIP_ENV = "LINEAR_CLI_SKIP_CHECKOUT_CHECK"
 
     # Only `lib/` and `exe/` count as "dirty": they are the code the CLI actually executes. Scoping the
-    # status this way also keeps bundler's vendored copy quiet — bundler rewrites the gemspec of a
-    # git-source gem in place, so `M linear_cli.gemspec` is permanent bookkeeping there, not a
-    # half-finished edit, and warning about it on every trader-ai `bin/linear` would train the eye to
-    # ignore the one line that matters.
+    # status this way is also what keeps bundler's vendored copy quiet — bundler rewrites the gemspec of
+    # a git-source gem in place, so `M linear_cli.gemspec` is permanent bookkeeping there rather than a
+    # half-finished edit, and crying wolf on every trader-ai `bin/linear` would train the eye to ignore
+    # the one line that matters.
     CODE_PATHS = %w[lib exe].freeze
+
+    # Bundler's install layout for a git-source gem (`<bundle path>/bundler/gems/<name>-<shortsha>`).
+    # Such a checkout is MANAGED: bundler re-clones it from Gemfile.lock, so a hand `git checkout`
+    # inside it is clobbered by the next `bundle install` and desyncs the lock. Staleness there is
+    # real and worth reporting — it means the Gemfile pin is behind — but the remedy is a different
+    # command, so it gets its own. (Whether such a copy carries tags at all varies with how the bundle
+    # was installed; both shapes are handled.)
+    BUNDLER_LAYOUT = %r{/bundler/gems/[^/]+/?\z}
 
     class << self
       # Print any warnings to stderr. Never raises and never exits: a missing git, an odd checkout or a
@@ -99,19 +107,22 @@ module LinearCli
         Gem::Version.new(tag.delete_prefix("v"))
       end
 
-      # "You are running old code" plus the ONE command that fixes this shape of checkout: a detached
-      # HEAD is a pinned box (move the pin to the new tag), anything else tracks a branch (fast-forward
-      # it). `--abbrev-ref HEAD` reports the literal string "HEAD" when detached. Resolving that costs a
-      # `git` process, so it happens here — only once we already know the checkout is behind.
+      # "You are running old code" plus the ONE command that fixes THIS shape of checkout — a remedy
+      # that would be undone by the tool managing the directory is worse than none. Bundler owns its
+      # install path (bump the pin instead); a detached HEAD is a pinned box (move the pin to the new
+      # tag); anything else tracks a branch (fast-forward it). `--abbrev-ref HEAD` reports the literal
+      # string "HEAD" when detached, and resolving it costs a `git` process — so it happens here, only
+      # once we already know the checkout is behind.
       def stale_lines(root, version, newest)
-        fix = if git(root, "rev-parse", "--abbrev-ref", "HEAD").to_s.strip == "HEAD"
-                "git fetch --tags origin && git checkout --detach #{newest}"
-              else
-                "git fetch origin main && git merge --ff-only origin/main"
-              end
-
-        ["  ! linear_cli #{version} is behind #{newest} — this checkout is serving old code (AGT-222)",
-         "    fix: cd #{sh(root)} && #{fix}"]
+        lines = ["  ! linear_cli #{version} is behind #{newest} — this checkout is serving old code (AGT-222)"]
+        lines << if root.match?(BUNDLER_LAYOUT)
+                   "    fix: bump the linear_cli tag to #{newest} in your Gemfile, then `bundle update linear_cli`"
+                 elsif git(root, "rev-parse", "--abbrev-ref", "HEAD").to_s.strip == "HEAD"
+                   "    fix: cd #{sh(root)} && git fetch --tags origin && git checkout --detach #{newest}"
+                 else
+                   "    fix: cd #{sh(root)} && git fetch origin main && git merge --ff-only origin/main"
+                 end
+        lines
       end
 
       # Uncommitted changes to executable code in the main worktree. Tracked files only: an untracked

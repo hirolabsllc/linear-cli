@@ -82,10 +82,25 @@ class LinearCliCheckoutTest < LinearCli::TestCase
   end
 
   test "a bundler-style modified gemspec is not dirty — only lib/ and exe/ are executed code" do
+    # A tag-pinned bundler checkout DOES carry tags, so the tag gate above does not save this one:
+    # scoping the status to executed code is what keeps it quiet.
     root = repo
     File.write(File.join(root, "linear_cli.gemspec"), "# rewritten by bundler\n")
 
     assert_empty LinearCli::Checkout.warnings(root: root, version: "2.0.0")
+  end
+
+  test "a lagging Gemfile pin is told to bump the pin, not to git-checkout inside bundler's directory" do
+    # Bundler re-clones its install path from Gemfile.lock, so a hand `git checkout` there is undone by
+    # the next `bundle install` and desyncs the lock. The staleness is real — the pin is behind — but a
+    # remedy the managing tool will clobber is worse than no remedy at all.
+    root  = repo(path: File.join("bundle", "bundler", "gems", "linear-cli-abc1234"))
+    lines = LinearCli::Checkout.warnings(root: root, version: "1.0.0")
+
+    refute_nil stale_line(lines), "a behind-pin bundler checkout is still stale: #{lines.inspect}"
+    assert_includes lines.join("\n"), "bundle update linear_cli"
+    refute_includes lines.join("\n"), "git checkout"
+    refute_includes lines.join("\n"), "merge --ff-only"
   end
 
   # --- staleness ----------------------------------------------------------------

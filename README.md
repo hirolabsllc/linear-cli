@@ -191,10 +191,11 @@ against a 200 ms+ API round-trip), no credentials, nothing that can hang. Conseq
   tagged from a worktree shares the clone's ref store, so the tag exists there the instant it is cut —
   and for surface 3 the update recipe opens with `fetch --tags`. Closing it for a box nobody ever
   fetches needs a cached `git ls-remote`; see AGT-220.
-- It is **silent on surfaces 1 and 2**, whose bundler-vendored checkout carries no tags (heads-only
-  refspec) and a permanently modified `linear_cli.gemspec` that bundler rewrites in place. That is
-  correct rather than a gap: there the `Gemfile` pin defines the version, and a warning on every
-  `bin/linear` in trader-ai would only train the eye past the one line that matters.
+- On **surfaces 1 and 2** it never cries wolf and never misdirects. Bundler's vendored checkout carries
+  a permanently modified `linear_cli.gemspec` — bundler rewrites it in place — which is why only `lib/`
+  and `exe/` count as dirty. And when the `Gemfile` pin genuinely *is* behind, the fix offered is to
+  bump the pin and `bundle update`, never a `git checkout` inside a directory bundler re-clones from
+  `Gemfile.lock` (which the next `bundle install` would undo, desyncing the lock).
 - Only **linked worktrees** are exempt from the dirty half — uncommitted work is a dev worktree's normal
   state, whereas in the main clone it is live for every caller.
 
