@@ -13,6 +13,7 @@
 # The class is namespaced as `Linear::Client` so a host app can `require "linear_cli"` and drive the
 # same conventions from its own code (e.g. an HTTP endpoint) without duplicating the GraphQL logic.
 require_relative "linear_cli/version"
+require_relative "linear_cli/checkout"
 require_relative "linear/client"
 
 module LinearCli

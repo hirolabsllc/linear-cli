@@ -121,6 +121,86 @@ bundle exec rake test     # Minitest, no network (GraphQL transport is stubbed)
 
 CI runs the same on Ruby 3.4.9 (`.github/workflows/ci.yml`).
 
+**Never edit `~/Developer/linear-cli` in place** — work in a `git worktree`. Three to six concurrent
+Claude sessions share that clone, *and* another team executes its working tree live (surface 4 below),
+so an uncommitted edit there is not a work in progress: it is a deploy.
+
+```bash
+git -C ~/Developer/linear-cli fetch origin main
+git -C ~/Developer/linear-cli worktree add -b <topic> /tmp/linear-cli-<topic> origin/main
+```
+
+## Releasing — a tag does not ship itself
+
+`git tag` publishes nothing. **Four independent checkouts run this gem**, each with its own staleness,
+and a release is not done until all four have moved (AGT-222):
+
+| # | Surface | Runs it | How it updates |
+|---|---|---|---|
+| 1 | trader-ai's bundle | team AKA + the app's admin endpoint | `Gemfile` tag → `bundle update linear_cli` → commit + push → Hatchbox deploy |
+| 2 | the shared trader-ai main checkout | concurrent Claude sessions | `bin/refresh-shared-checkout` |
+| 3 | `/opt/linear-cli` on `ops.hirolabs.com` | Hermes agents, via `/opt/agent-ops/bin/linear` | SSH as `root`, run git as `claude` so ownership survives (AGT-218) |
+| 4 | `~/Developer/linear-cli` — the plain clone | **team ORC**: cerails' `bin/linear` execs this **working tree** | `git merge --ff-only origin/main` |
+
+**Surface 4 has no Gemfile, no bundle and no deploy step.** cerails' app Ruby is 3.2.2, below this gem's
+`>= 3.4` floor, so it deliberately does not vendor the gem and instead runs
+`$HOME/Developer/linear-cli/exe/linear` directly under rbenv 3.4.9 (override with `LINEAR_CLI_DIR`).
+The working tree *is* production for another team: **stale means ORC runs old code, dirty means ORC runs
+your half-finished edit** — and neither used to say so. AGT-217 measured exactly that, with the clone one
+commit behind `origin/main` still returning comments newest-first after the fix was tagged and every
+other surface had moved.
+
+```bash
+bundle exec rake test                                       # green first
+$EDITOR lib/linear_cli/version.rb CHANGELOG.md              # bump + describe
+git commit -am "<summary> (TEAM-N)"
+git tag vX.Y.Z && git push origin main vX.Y.Z
+
+# 4 — do this in the same breath as the push; it is the surface with no deploy gate
+git -C ~/Developer/linear-cli fetch --tags origin
+git -C ~/Developer/linear-cli merge --ff-only origin/main
+
+# 3 — the box fetches over https (public repo, no credential); run the git as `claude`
+ssh root@ops.hirolabs.com \
+  'sudo -u claude git -C /opt/linear-cli fetch --tags --prune origin &&
+   sudo -u claude git -C /opt/linear-cli checkout --detach vX.Y.Z'
+
+# 1 + 2 — in trader-ai: bump the Gemfile tag, bundle update linear_cli, push, then
+bin/refresh-shared-checkout
+```
+
+### Staleness announces itself
+
+Since v2.8.0 the CLI checks the checkout it was loaded from and prints to **stderr** — before running
+the command, never blocking it — when that checkout is **behind the newest tag it knows about** or has
+**uncommitted changes under `lib/` or `exe/`**:
+
+```
+  ! linear_cli 2.7.0 is behind v2.8.0 — this checkout is serving old code (AGT-222)
+    fix: cd /Users/you/Developer/linear-cli && git fetch origin main && git merge --ff-only origin/main
+```
+
+It lives in the gem (`LinearCli::Checkout`, called from `exe/linear`), not in each host's `bin/linear`,
+so every shim inherits it — the shims stay thin. The fix line matches the checkout's shape: a detached
+HEAD is a pinned box, so it is told to move the pin to the new tag.
+
+The check is **local-only and never touches the network**: one or two `git` invocations (~10–20 ms
+against a 200 ms+ API round-trip), no credentials, nothing that can hang. Consequences of that choice:
+
+- It **cannot see a tag the checkout has never fetched.** For surface 4 that is a non-issue — a release
+  tagged from a worktree shares the clone's ref store, so the tag exists there the instant it is cut —
+  and for surface 3 the update recipe opens with `fetch --tags`. Closing it for a box nobody ever
+  fetches needs a cached `git ls-remote`; see AGT-220.
+- It is **silent on surfaces 1 and 2**, whose bundler-vendored checkout carries no tags (heads-only
+  refspec) and a permanently modified `linear_cli.gemspec` that bundler rewrites in place. That is
+  correct rather than a gap: there the `Gemfile` pin defines the version, and a warning on every
+  `bin/linear` in trader-ai would only train the eye past the one line that matters.
+- Only **linked worktrees** are exempt from the dirty half — uncommitted work is a dev worktree's normal
+  state, whereas in the main clone it is live for every caller.
+
+Silence it with `LINEAR_CLI_SKIP_CHECKOUT_CHECK=1` (a box held back on purpose, or a caller that parses
+stderr).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

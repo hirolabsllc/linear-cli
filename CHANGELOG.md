@@ -1,5 +1,44 @@
 # Changelog
 
+## [2.8.0] — 2026-08-04
+
+**A gem tag reaches FOUR checkouts, and a stale one said nothing (AGT-222).** Tagging this gem ships it
+nowhere. Four independent checkouts run it — trader-ai's bundle, the shared main checkout, the agent-ops
+box at `/opt/linear-cli`, and the plain clone at `~/Developer/linear-cli` — and only two were written
+down anywhere. The fourth is the one that matters most and was documented in no repo at all: cerails'
+`bin/linear` `exec`s that **working tree** directly, because cerails' app Ruby is 3.2.2 against this
+gem's `>= 3.4` floor, so it deliberately does not vendor the gem and has no Gemfile entry, no bundle and
+no deploy step. The working tree is production for another team.
+
+Both of its failure modes were silent, and both were measured. **Stale:** while shipping AGT-217 the
+clone sat one commit behind `origin/main`, so ORC's `bin/linear` kept returning comments newest-first
+*after* v2.6.0 was tagged and every other surface had updated — no version banner, no drift warning,
+nothing to notice. **Dirty:** a half-finished edit in that tree is executed live by another team with no
+deploy gate in between. Same shape as AKA-193 and AGT-218 (a box four releases and 45 days behind), on
+the one surface neither covered.
+
+- **The CLI now says so, on stderr, before it runs the command.** `LinearCli::Checkout` compares the
+  checkout `exe/linear` was loaded from against the newest `vX.Y.Z` tag that checkout knows about, and
+  reports uncommitted changes under `lib/`/`exe/`. The fix line matches the checkout's shape — a
+  detached HEAD is a pinned box, so it is told to move the pin rather than to fast-forward. Advisory
+  only: it never blocks the command, and a missing git, an odd checkout or an unparseable version is
+  swallowed rather than allowed to take ticketing down.
+- **It lives in the gem, so every shim inherits it.** `exe/linear` calls it, not each host's
+  `bin/linear` — the shims stay thin. Not on `require "linear_cli"`, so a host app driving
+  `Linear::Client` from a web request (trader-ai's admin endpoint) never shells out to git mid-request.
+- **Local-only, no network, ~10–20 ms** — one or two `git` invocations against a 200 ms+ API round-trip,
+  no credentials, nothing that can hang. It therefore cannot see a tag a checkout has never fetched;
+  that is closed from the other end by the release recipe, which fast-forwards the plain clone in the
+  same breath as `git push`. A cached `git ls-remote` would close it for a box nobody fetches (AGT-220).
+- **Deliberately silent where a warning would be noise.** A packaged `gem install` has no `.git`; a
+  bundler-vendored checkout has no tags (heads-only refspec) and a permanently modified
+  `linear_cli.gemspec` that bundler rewrites in place — there the `Gemfile` pin defines the version, and
+  crying wolf on every `bin/linear` in trader-ai would train the eye past the one line that matters.
+  Linked worktrees are exempt from the dirty half, since uncommitted work is a dev worktree's normal
+  state. `LINEAR_CLI_SKIP_CHECKOUT_CHECK=1` opts out entirely.
+- **All four surfaces are now documented in one place** — README, "Releasing — a tag does not ship
+  itself", with the propagation command for each. trader-ai's and cerails' own rules point at it.
+
 ## [2.7.0] — 2026-08-04
 
 **`list` silently truncated every result at 50 rows (AGT-224).** The query passed no `first:` and never

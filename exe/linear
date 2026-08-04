@@ -899,4 +899,11 @@ rescue Linear::Client::Error => e
 end
 
 # Autorun unless a test loaded us purely to reach the helpers (see the note on `run`).
-run(ARGV) unless ENV["LINEAR_CLI_SKIP_MAIN"] == "1"
+unless ENV["LINEAR_CLI_SKIP_MAIN"] == "1"
+  # A gem tag does not ship itself, and four separate checkouts run this file — so before anything
+  # else, say on stderr when THIS one is behind the newest tag it knows about, or has uncommitted
+  # edits that every caller is executing live (AGT-222). Advisory only: it never blocks the command.
+  # It lives in the gem rather than in each host's `bin/linear` so every shim inherits it.
+  LinearCli::Checkout.warn!
+  run(ARGV)
+end
