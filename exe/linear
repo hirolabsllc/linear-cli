@@ -510,17 +510,34 @@ def cmd_list(args)
   status_filter = nil
   label_filter  = nil
   team_key      = default_team
+  limit         = nil
   i = 0
   while i < args.length
     case args[i]
     when "--status" then status_filter = args[i + 1]; i += 2
     when "--label"  then label_filter  = args[i + 1]; i += 2
     when "--team"   then team_key      = args[i + 1]; i += 2
+    when "--limit"  then limit         = args[i + 1]; i += 2
     else i += 1
     end
   end
 
-  issues = CLIENT.list(status: status_filter, label: label_filter, team: team_key)
+  # A typo'd --limit must not coerce to 0 and print "No issues found." — that is the same silent
+  # wrong answer, in miniature, that AGT-224 was filed for.
+  if limit
+    limit = begin
+      Integer(limit.to_s.strip, 10)
+    rescue ArgumentError, TypeError
+      abort "#{PROG} list: --limit takes a positive integer, got #{limit.inspect}"
+    end
+    abort "#{PROG} list: --limit must be positive, got #{limit}" unless limit.positive?
+  end
+
+  # No --limit means EVERY matching issue, however many pages that takes (AGT-224). --limit is the
+  # opt-in for a caller that only wants the oldest N and would rather not page a whole team for them
+  # (e.g. a `--status done` lane thousands deep); it is never a default, because a quietly capped list
+  # is the bug this command was fixed for.
+  issues = CLIENT.list(status: status_filter, label: label_filter, team: team_key, limit: limit)
   if issues.empty?
     puts "No issues found."
     return
@@ -818,7 +835,8 @@ def run(argv = ARGV)
         create  "Title" [--team KEY] [--label Bug|Feature|Infrastructure|Ops] [--priority urgent|high|medium|low] [--desc "body" | --desc-file PATH|-] [--image PATH ...]
                 [--parent ISSUE-N] [--blocked-by ISSUE-N] [--blocks ISSUE-N] [--related ISSUE-N]   ← link deps AT create time
         search  "<keywords>" [--limit N]             full-text dedup search (ALL states; run BEFORE create)
-        list    [--status todo|in_progress|done] [--label Bug] [--team KEY]
+        list    [--status todo|in_progress|done] [--label Bug] [--team KEY] [--limit N]
+                └─ returns EVERY matching issue (paginated); --limit N caps it at the oldest N
         view    ISSUE-N                                shows parent/sub-issues/relations under "Links:"
         url     ISSUE-N
         retitle ISSUE-N "New title"                     change an issue's title (alias: rename); prints old → new

@@ -49,7 +49,7 @@ linear start  ENG-12 --session "my session"      # → In Progress
 linear review ENG-12 --sha <sha>                 # → In Review (+ clickable commit link)
 linear close  ENG-12 --comment "verified"        # → Done
 linear view   ENG-12                             # parent / sub-issues / relations + comment ids
-linear list   --status in_progress --team ENG
+linear list   --status in_progress --team ENG     # EVERY match, paginated; --limit N caps it
 
 linear edit   ENG-12 --desc-file board.md        # REPLACE the description in place (posts no comment)
 
@@ -58,6 +58,15 @@ linear comments       ENG-12                      # list comment ids
 linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md / -
 linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comment
 ```
+
+**`list` returns every match, not one page.** Linear's `issues` connection caps a query that omits
+`first:` at **50 nodes** silently — no error, no marker — so `list` used to report a 98-issue lane as 50
+and a truncated lane was indistinguishable from a short one. It now pages the connection to exhaustion,
+and `--label` is filtered by Linear rather than applied to a page already thrown away (which is why
+`--status backlog --label Bug` answered 19 when the truth was 54). Pass `--limit N` when you only want
+the oldest N and would rather not page a whole team for them; without it you get everything. If the
+10,000-issue safety ceiling is ever reached, `list` says so on **stderr** and labels the rows
+`INCOMPLETE` — a short list is never returned in silence.
 
 **`edit` vs `comment`** — an issue's *description* is **now** (the current state, rewritten in place);
 its *comments* are **how it got here**. `edit` replaces the whole description and never posts a

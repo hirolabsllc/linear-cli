@@ -789,4 +789,221 @@ class Linear::ClientTest < LinearCli::TestCase
     r = resp(code: 429, body: "", headers: { "X-RateLimit-Requests-Reset" => reset_ms })
     assert_equal Linear::Client::MAX_BACKOFF, client.send(:retry_delay, r, 1)
   end
+
+  # --- list pagination (AGT-224) ---------------------------------------------
+
+  # A fake `issues` connection over `total` issues, served in pages of whatever `first:` asks for and
+  # walked by the same `after:`/`endCursor` contract Linear uses.
+  #
+  # It records every set of variables the client sent, because the returned array is where this bug
+  # HID: a lane truncated at Linear's 50-node default is byte-for-byte indistinguishable from a lane
+  # that is genuinely 50 long. What has to be pinned is the request — an explicit `first:` and a
+  # followed cursor — not just the rows that come back.
+  class FakeIssues
+    attr_reader :calls
+
+    # `labels: nil` builds rows with no `labels` key at all — a payload the old client-side select
+    # would have thrown away wholesale.
+    def initialize(total:, labels: [{ "name" => "Bug" }])
+      @rows = (1..total).map do |n|
+        row = { "identifier" => "AKA-#{n}", "title" => "issue #{n}", "priority" => 3, "url" => "u#{n}",
+                "state" => { "name" => "In Review" } }
+        row["labels"] = { "nodes" => labels } if labels
+        row
+      end
+      @calls = []
+    end
+
+    def to_proc
+      ->(query, vars) { serve(query, vars) }
+    end
+
+    private
+
+    def serve(query, vars)
+      @calls << vars.merge(query: query)
+      # Cursors are opaque to the client, so encode the offset in one: a client that ignores endCursor
+      # re-reads page one forever and the row assertions below catch it.
+      offset = vars[:after].to_s.empty? ? 0 : vars[:after].to_s.delete_prefix("cursor-").to_i
+      page   = @rows[offset, vars[:first].to_i] || []
+      seen   = offset + page.length
+      { "issues" => {
+        "nodes" => page,
+        "pageInfo" => { "hasNextPage" => seen < @rows.length, "endCursor" => "cursor-#{seen}" }
+      } }
+    end
+  end
+
+  # `teams` is stubbed rather than served through the graphql fake because `team_id_for` resolves it
+  # with a one-argument `graphql(query)` call, which a two-argument fake could not answer.
+  def with_fake_issues(total:, **opts)
+    fake = FakeIssues.new(total: total, **opts)
+    client.stub(:teams, TEAMS) do
+      client.stub(:graphql, fake.to_proc) { yield fake }
+    end
+  end
+
+  # The bug itself. This lane used to come back as 50 rows — no error, no marker, nothing short to
+  # notice. The total deliberately spans three pages so the walk, not just a bigger single page, is
+  # what is being proved.
+  test "list returns every matching issue instead of stopping at Linear's 50-node default" do
+    total = (Linear::Client::MAX_PAGE_SIZE * 2) + 137
+    with_fake_issues(total: total) do |fake|
+      rows = client.list(team: "ENG")
+      assert_equal total, rows.length, "a #{total}-issue lane must return #{total} rows, not one page"
+      assert_equal (1..total).map { |n| "AKA-#{n}" }, rows.map { |r| r["identifier"] },
+                   "every page must be concatenated in order, with none repeated or dropped"
+      assert_equal 3, fake.calls.length, "#{total} issues span three pages — the cursor must be followed"
+    end
+  end
+
+  # The root cause, pinned directly: the old query named no `first:` at all, which is precisely why
+  # Linear applied its default of 50.
+  test "list sends an explicit first: and asks for pageInfo" do
+    with_fake_issues(total: 10) do |fake|
+      client.list(team: "ENG")
+      assert_equal Linear::Client::MAX_PAGE_SIZE, fake.calls.first[:first],
+                   "an absent first: is what silently caps the connection at 50"
+      assert_operator Linear::Client::MAX_PAGE_SIZE, :<=, 250, "251 is an Argument Validation Error at Linear"
+      assert_includes fake.calls.first[:query], "pageInfo",
+                      "without pageInfo the client cannot know a page was truncated"
+      assert_includes fake.calls.first[:query], "hasNextPage"
+      assert_includes fake.calls.first[:query], "endCursor"
+    end
+  end
+
+  # `orderBy: createdAt` is load-bearing downstream (the row order the board dumps parse) and must
+  # survive the rewrite, alongside a cursor that actually advances.
+  test "list walks pageInfo.endCursor and keeps the createdAt ordering" do
+    with_fake_issues(total: 600) do |fake|
+      client.list(team: "ENG")
+      assert_equal [nil, "cursor-250", "cursor-500"], fake.calls.map { |c| c[:after] },
+                   "each request after the first must carry the previous page's endCursor"
+      assert_includes fake.calls.first[:query], "orderBy: createdAt"
+    end
+  end
+
+  test "list makes exactly one request when the first page is the whole lane" do
+    with_fake_issues(total: 12) do |fake|
+      assert_equal 12, client.list(team: "ENG").length
+      assert_equal 1, fake.calls.length, "hasNextPage: false must end the walk"
+    end
+  end
+
+  # A connection that never reports an end must stop at the ceiling AND say so. A silent short list is
+  # the defect; a wrong count that announces itself is recoverable.
+  test "list stops at the page ceiling and reports the truncation on stderr" do
+    calls = 0
+    endless = ->(_query, vars) do
+      calls += 1
+      { "issues" => {
+        "nodes" => Array.new(vars[:first].to_i) { |i| { "identifier" => "AKA-#{calls}-#{i}" } },
+        "pageInfo" => { "hasNextPage" => true, "endCursor" => "cursor-#{calls}" }
+      } }
+    end
+
+    rows = nil
+    _out, err = capture_io do
+      client.stub(:teams, TEAMS) do
+        client.stub(:graphql, endless) { rows = client.list(team: "ENG") }
+      end
+    end
+
+    assert_equal Linear::Client::MAX_LIST_PAGES, calls, "a connection that never ends must not loop forever"
+    assert_equal Linear::Client::MAX_LIST_PAGES * Linear::Client::MAX_PAGE_SIZE, rows.length,
+                 "everything fetched before the ceiling is still returned"
+    assert_match(/TRUNCATED/, err, "hitting the ceiling must never be silent — that is the whole bug")
+    assert_match(/INCOMPLETE/, err)
+  end
+
+  # `hasNextPage: true` with nothing to follow would re-request page one until the ceiling, quietly
+  # multiplying the same rows.
+  test "list treats a blank endCursor as the end of the connection" do
+    calls = 0
+    stuck = ->(_query, _vars) do
+      calls += 1
+      { "issues" => { "nodes" => [{ "identifier" => "AKA-1" }],
+                      "pageInfo" => { "hasNextPage" => true, "endCursor" => nil } } }
+    end
+    client.stub(:teams, TEAMS) do
+      client.stub(:graphql, stuck) do
+        assert_equal %w[AKA-1], client.list(team: "ENG").map { |r| r["identifier"] }
+      end
+    end
+    assert_equal 1, calls, "a hasNextPage with no cursor must not re-request page one"
+  end
+
+  # The compounding half of AGT-224: the label filter ran in Ruby over the already-truncated page, so
+  # `--label Bug` answered "the Bug-labelled ones among the oldest 50" — a plausible near-zero count,
+  # returned exactly when a caller stops expecting a big number.
+  test "list hands the label filter to Linear rather than selecting over one page" do
+    with_fake_issues(total: 300) do |fake|
+      rows = client.list(team: "ENG", label: "Bug")
+      assert_equal({ name: { eqIgnoreCase: "Bug" } }, fake.calls.first[:filter][:labels],
+                   "the label must be filtered by Linear, across the whole connection")
+      assert_equal 300, rows.length, "a label-filtered lane must paginate too, not stop at one page"
+    end
+  end
+
+  # Since Linear now guarantees the match, the rows it returns are the answer — re-selecting on the
+  # `labels` payload client-side would discard matches whose labels the query did not surface.
+  test "list keeps Linear's label matches even when a row carries no labels payload" do
+    with_fake_issues(total: 3, labels: nil) do
+      assert_equal 3, client.list(team: "ENG", label: "Bug").length
+    end
+  end
+
+  test "list maps a lifecycle status to a state type and passes anything else straight through" do
+    with_fake_issues(total: 1) do |fake|
+      client.list(team: "ENG", status: "in_progress")
+      assert_equal({ type: { eq: "started" } }, fake.calls.first[:filter][:state])
+    end
+    with_fake_issues(total: 1) do |fake|
+      client.list(team: "ENG", status: "todo")
+      assert_equal({ type: { eq: "unstarted" } }, fake.calls.first[:filter][:state])
+    end
+    # `/board` dumps these two by their Linear type name, so they must survive untranslated.
+    with_fake_issues(total: 1) do |fake|
+      client.list(team: "ENG", status: "backlog")
+      assert_equal({ type: { eq: "backlog" } }, fake.calls.first[:filter][:state])
+    end
+  end
+
+  # `limit:` exists so a caller that wants ten rows does not page a 1,600-issue team to throw the rest
+  # away — the host app's admin endpoint asks for ten and used to get its cap for free from the bug.
+  test "list with a limit stops as soon as it has the rows, asking Linear for only those" do
+    with_fake_issues(total: 500) do |fake|
+      rows = client.list(team: "ENG", limit: 10)
+      assert_equal 10, rows.length
+      assert_equal (1..10).map { |n| "AKA-#{n}" }, rows.map { |r| r["identifier"] }
+      assert_equal 1, fake.calls.length, "ten rows must cost one request, not two full pages"
+      assert_equal 10, fake.calls.first[:first], "ask for the limit, not a full page to be discarded"
+    end
+  end
+
+  test "list with a limit spanning pages asks only for the remainder on the last page" do
+    with_fake_issues(total: 500) do |fake|
+      assert_equal 300, client.list(team: "ENG", limit: 300).length
+      assert_equal [250, 50], fake.calls.map { |c| c[:first] }
+    end
+  end
+
+  test "list with a non-positive limit returns nothing without calling Linear" do
+    with_fake_issues(total: 50) do |fake|
+      assert_empty client.list(team: "ENG", limit: 0)
+      assert_empty client.list(team: "ENG", limit: -3)
+      assert_empty fake.calls
+    end
+  end
+
+  test "list returns an empty array when the connection comes back empty or malformed" do
+    client.stub(:teams, TEAMS) do
+      client.stub(:graphql, ->(*_a) { { "issues" => { "nodes" => [], "pageInfo" => { "hasNextPage" => false } } } }) do
+        assert_empty client.list(team: "ENG")
+      end
+      client.stub(:graphql, ->(*_a) { {} }) do
+        assert_empty client.list(team: "ENG")
+      end
+    end
+  end
 end

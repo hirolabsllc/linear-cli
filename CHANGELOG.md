@@ -1,5 +1,49 @@
 # Changelog
 
+## [2.7.0] — 2026-08-04
+
+**`list` silently truncated every result at 50 rows (AGT-224).** The query passed no `first:` and never
+read `pageInfo`, so Linear applied its default page size and handed back 50 nodes — with no error, no
+marker on the response and nothing short to notice. A truncated lane was byte-for-byte indistinguishable
+from a lane that is genuinely 50 long, which is why this shipped and stayed unnoticed: the defect was
+invisible in the only thing a caller looked at. `linear list --status in_progress` on team AKA reported
+**In Progress 28 / In Review 70 as 15 / 35** (measured 2026-08-04) — 48 of 98 issues gone. `orderBy:
+createdAt` compounded it: the surviving 50 were the **oldest**, so what fell off the end was the newest,
+most actionable work.
+
+It was not a CLI nit. `/board` derives its lane counts, `free_slots` and every invariant check from these
+text dumps, so a third of the review backlog was invisible on the one screen meant to show it, and
+Invariant 1 (`In Progress` ⇔ a live session) could only check the tickets it could see. The admission-halt
+verdict happened to survive — 35 and 70 are both far over a cap of 10 — but that was luck, not
+correctness.
+
+- **`list` now pages the connection to exhaustion**, `MAX_PAGE_SIZE` (250) at a time, following
+  `pageInfo.endCursor` until `hasNextPage` is false. A blank `endCursor` ends the walk, so a
+  `hasNextPage` with nothing to follow cannot re-request page one in a loop.
+- **`--label` is filtered by Linear, not in Ruby over a page already discarded.** This was the
+  compounding half of the bug and strictly the worse one: `--status backlog --label Bug` did not return
+  the Bug-labelled Backlog issues, it returned the Bug-labelled ones *among the oldest 50* — **19 rows
+  when the truth was 54**. That count is plausible, and adding a filter is exactly when a caller stops
+  expecting a big number, so there was nothing to notice at all. `labels: { name: { eqIgnoreCase: } }`
+  matches an issue carrying some label of that name; verified against a multi-labelled issue and against
+  the old client-side predicate over a fully-paginated set (identical rows).
+- **A ceiling that announces itself.** `Linear::Client::MAX_LIST_PAGES` (40 → 10,000 issues, against
+  1,597 in the largest team here) bounds a pathological query. Reaching it prints a `list TRUNCATED …
+  INCOMPLETE` warning to **stderr** and returns what it has. Silent truncation is the actual defect; a
+  wrong count that announces itself is recoverable, one that doesn't is not.
+- **New `limit:` / `--limit N`** — caps the rows *and* stops the walk as soon as it has them, so ten rows
+  cost one request asking for ten rather than seven full pages thrown away. It is never a default: an
+  omitted `--limit` means everything. Because both filters are now Linear's, a `--limit` row count is
+  exact, which post-filtering could not be. A non-numeric or non-positive `--limit` aborts rather than
+  coercing to 0 and printing "No issues found." — the same silent wrong answer in miniature.
+- **The row format is unchanged, byte for byte.** `.claude/skills/board/collect.py` and the skills parse
+  these dumps line-by-line, so this is a completeness fix and nothing else: the first 50 rows of the new
+  output diff clean against 2.6.0's entire output, and the 98/314/54 totals were cross-checked against
+  raw paginated GraphQL.
+- **Thirteen tests pin the request, not just the result** — an explicit `first:`, a followed cursor, the
+  ceiling warning, the server-side label filter, and the `limit:` short-circuit. Ten of them fail against
+  2.6.0. Asserting only on returned rows is what let a 50-row cap look correct.
+
 ## [2.6.0] — 2026-07-30
 
 **`Linear::Client#comments` returned the reverse of what it documented (AGT-217).** The method promised

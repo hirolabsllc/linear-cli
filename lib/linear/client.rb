@@ -815,8 +815,30 @@ module Linear
       data.dig("searchIssues", "nodes") || []
     end
 
-    # List team issues, optionally filtered by lifecycle status and/or label name. Returns nodes.
-    def list(status: nil, label: nil, team: nil)
+    # Pages {#list} will walk before it gives up — 40 × {MAX_PAGE_SIZE} = 10,000 issues, far above any
+    # real team (AKA, the largest here, holds 1,597 in total) and low enough that a pathological filter
+    # cannot spin forever. Hitting it is reported on stderr, never absorbed: see {#list}.
+    MAX_LIST_PAGES = 40
+
+    # List team issues, optionally filtered by lifecycle status and/or label name. Returns nodes in
+    # `createdAt` order (oldest first).
+    #
+    # **Paginated to exhaustion, which is the whole point of this method's shape (AGT-224).** Linear's
+    # `issues` connection returns **50 nodes** when a query omits `first:` — a silent cap, with no marker
+    # on the response and no error. This query omitted it, so every list the CLI ever printed was capped
+    # at 50 and indistinguishable from a genuinely short one: `list --status in_progress` reported In
+    # Progress 15 / In Review 35 against real counts of 28 / 70 (measured 2026-08-04). `/board` derives
+    # its lane counts, `free_slots` and every invariant check from these dumps, so a third of the review
+    # backlog was invisible on the one screen meant to show it. `orderBy: createdAt` compounded it: the
+    # surviving 50 were the OLDEST, so what fell off the end was the newest — most actionable — work.
+    #
+    # `limit:` caps the rows AND stops the walk as soon as it has them, so a caller that wants 10 rows
+    # makes one request asking for 10 rather than paging a 1,600-issue team and discarding the rest.
+    # `limit: 0` returns none, matching the `.first(limit)` it replaces.
+    def list(status: nil, label: nil, team: nil, limit: nil)
+      limit = limit&.to_i
+      return [] if limit && limit <= 0
+
       filter = { team: { id: { eq: team_id_for(team || team_key) } } }
       if status
         type = case status.to_s.downcase
@@ -827,23 +849,55 @@ module Linear
                end
         filter[:state] = { type: { eq: type } }
       end
+      # Filtered by Linear, NOT in Ruby afterwards. Selecting on labels client-side made `--label`
+      # strictly worse than the bare truncation: it answered "the Bug-labelled ones among the oldest 50"
+      # with a plausible near-zero count, and adding a filter is exactly when a caller stops expecting a
+      # big number. `eqIgnoreCase` matches an issue carrying SOME label of that name — verified against a
+      # multi-labelled issue, and against the old client-side predicate over a fully-paginated set
+      # (identical rows, 384 of them). It also keeps a `limit:` row count exact, which post-filtering
+      # cannot.
+      filter[:labels] = { name: { eqIgnoreCase: label.to_s } } if label
 
-      data = graphql(<<~GQL, { filter: filter })
-        query($filter: IssueFilter!) {
-          issues(filter: $filter, orderBy: createdAt) {
-            nodes {
-              identifier title priority url
-              state { name }
-              labels { nodes { name } }
+      issues = []
+      cursor = nil
+      pages  = 0
+      loop do
+        want = limit ? [limit - issues.length, MAX_PAGE_SIZE].min : MAX_PAGE_SIZE
+        data = graphql(<<~GQL, { filter: filter, first: want, after: cursor })
+          query($filter: IssueFilter!, $first: Int!, $after: String) {
+            issues(filter: $filter, orderBy: createdAt, first: $first, after: $after) {
+              nodes {
+                identifier title priority url
+                state { name }
+                labels { nodes { name } }
+              }
+              pageInfo { hasNextPage endCursor }
             }
           }
-        }
-      GQL
-      issues = data.dig("issues", "nodes") || []
-      if label
-        issues = issues.select { |i| i.dig("labels", "nodes")&.any? { |l| l["name"].downcase == label.downcase } }
+        GQL
+        conn = data["issues"] || {}
+        issues.concat(conn["nodes"] || [])
+        pages += 1
+        break if limit && issues.length >= limit
+
+        info   = conn["pageInfo"] || {}
+        cursor = info["endCursor"].to_s
+        # `hasNextPage` with no cursor to follow would re-request page one forever, so a blank
+        # `endCursor` ends the connection.
+        break unless info["hasNextPage"] && !cursor.empty?
+
+        if pages >= MAX_LIST_PAGES
+          # Say so, loudly, on stderr. Returning a short list in silence IS the defect this method was
+          # filed for — a wrong count that announces itself is recoverable, one that doesn't is not. The
+          # ceiling sits high enough that a real board cannot reach it, so if this ever fires the caller
+          # genuinely needs to know the numbers below are incomplete.
+          warn "[linear] list TRUNCATED: stopped at the #{MAX_LIST_PAGES}-page ceiling with " \
+               "#{issues.length} issues and Linear reporting more. These rows are INCOMPLETE — " \
+               "narrow the query (--status / --label / --team) or raise Linear::Client::MAX_LIST_PAGES."
+          break
+        end
       end
-      issues
+      limit ? issues.first(limit) : issues
     end
 
     # --- file upload (GraphQL half only) ------------------------------------
