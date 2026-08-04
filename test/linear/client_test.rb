@@ -807,7 +807,7 @@ class Linear::ClientTest < LinearCli::TestCase
     def initialize(total:, labels: [{ "name" => "Bug" }])
       @rows = (1..total).map do |n|
         row = { "identifier" => "AKA-#{n}", "title" => "issue #{n}", "priority" => 3, "url" => "u#{n}",
-                "state" => { "name" => "In Review" } }
+                "state" => { "name" => "In Review", "type" => "started" } }
         row["labels"] = { "nodes" => labels } if labels
         row
       end
@@ -1005,5 +1005,48 @@ class Linear::ClientTest < LinearCli::TestCase
         assert_empty client.list(team: "ENG")
       end
     end
+  end
+
+  # --- search/list node parity (AGT-230) --------------------------------------
+
+  # The `state { … }` sub-selection of a query, as a sorted field list.
+  def state_fields(query)
+    query[/state\s*\{([^}]*)\}/, 1].to_s.split.sort
+  end
+
+  # The bug. `#list` asked for `state { name }` while `#search` asked for `state { name type }`, and
+  # trader-ai's admin endpoint flattens BOTH through one serializer that reads `state.type`. So
+  # `GET /api/v1/admin/linear_issues` answered a real `state_type` under `?q=` and `null` under
+  # `?status=`/`?label=` — same documented field, value decided by which branch ran. The endpoint's own
+  # controller test could not catch it: its fake client's `list` fixture supplied a `state.type` this
+  # query never asked Linear for, so the fixture was more generous than the client.
+  test "list selects state.type, so a listed row can report its workflow type" do
+    with_fake_issues(total: 1) do |fake|
+      client.list(team: "ENG")
+      assert_includes state_fields(fake.calls.first[:query]), "type",
+                      "a row whose state.type was never selected serializes as state_type: null"
+    end
+  end
+
+  # The parity itself, not merely the presence of `type` — whatever one sibling selects on `state`, the
+  # other must too. Adding a field to one query alone is exactly how this recurred, and a caller that
+  # picks a branch by whether it has a search term cannot absorb the difference.
+  test "list and search select the same state fields" do
+    list_query = nil
+    with_fake_issues(total: 1) do |fake|
+      client.list(team: "ENG")
+      list_query = fake.calls.first[:query]
+    end
+
+    search_query = nil
+    capture = ->(query, _vars) do
+      search_query = query
+      { "searchIssues" => { "nodes" => [] } }
+    end
+    client.stub(:graphql, capture) { client.search("anything") }
+
+    assert_equal %w[name type], state_fields(search_query), "search is the reference selection here"
+    assert_equal state_fields(search_query), state_fields(list_query),
+                 "the two sibling queries feed one serializer — a state field in either must be in both"
   end
 end

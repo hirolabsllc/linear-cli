@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.8.2] — 2026-08-04
+
+**One serializer, two queries, and only one of them selected `state.type` (AGT-230).** `#search` asked
+Linear for `state { name type }`; `#list` asked for `state { name }`. A caller picks between the two by
+whether it has a search term and then flattens whichever it got through a single serializer — trader-ai's
+`Api::V1::Admin::LinearIssuesController#issue_row` reads `state.type` for both branches — so
+`GET /api/v1/admin/linear_issues` returned a real `state_type` under `?q=<term>` and **always `null`**
+under `?status=` / `?label=`. Same documented field, same code path, value decided by which sibling ran,
+and no way for a consumer to tell "this issue has no workflow type" from "you used the other branch".
+The endpoint's own controller test could not catch it: the fake client's `list` fixture supplied a
+`state.type` the real query never asked for, so the fixture was more generous than the client.
+
+- **`#list` now selects `state { name type }`**, so both branches populate `state_type`. Found while
+  fixing AGT-224 and deliberately left out of that release to keep the diff to the truncation bug.
+- **The parity is pinned, not just the field.** A test asserts `#list` and `#search` select the same
+  `state` sub-selection, because adding a field to one sibling alone is exactly how this recurred.
+- **Host-visible:** the admin endpoint's list branch changes `state_type` from `null` to the real
+  workflow type (`backlog` / `unstarted` / `started` / `completed` / `canceled`) — which is what its
+  openapi contract already documented, so the response now matches the spec rather than the spec moving.
+  `state_type` stays nullable (a node with no `state` still yields `null`). `exe/linear`'s `list`
+  renderer prints `state.name` only, so CLI output is unchanged.
+
 ## [2.8.1] — 2026-08-04
 
 **The stale-checkout warning offered bundler a remedy bundler would undo (AGT-222).** Found while

@@ -835,6 +835,15 @@ module Linear
     # `limit:` caps the rows AND stops the walk as soon as it has them, so a caller that wants 10 rows
     # makes one request asking for 10 rather than paging a 1,600-issue team and discarding the rest.
     # `limit: 0` returns none, matching the `.first(limit)` it replaces.
+    #
+    # **The node shape must match {#search}'s, `state { name type }` included (AGT-230).** These two are
+    # siblings: a caller picks one by whether it has a search term, and flattens whichever it got through
+    # ONE serializer. This query selected `state { name }` alone, so trader-ai's admin endpoint —
+    # `Api::V1::Admin::LinearIssuesController#issue_row`, `state_type: i.dig("state", "type")` for both
+    # branches — returned a real `state_type` under `?q=` and `null` under `?status=`/`?label=`, from the
+    # same documented field. A consumer could not tell "no workflow type" from "you used the other
+    # branch". A field either branch reads belongs in both selections; adding one to a single sibling is
+    # how this recurs.
     def list(status: nil, label: nil, team: nil, limit: nil)
       limit = limit&.to_i
       return [] if limit && limit <= 0
@@ -868,7 +877,7 @@ module Linear
             issues(filter: $filter, orderBy: createdAt, first: $first, after: $after) {
               nodes {
                 identifier title priority url
-                state { name }
+                state { name type }
                 labels { nodes { name } }
               }
               pageInfo { hasNextPage endCursor }
