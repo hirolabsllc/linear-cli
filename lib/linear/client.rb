@@ -381,7 +381,20 @@ module Linear
 
     # --- title / comment / labels -------------------------------------------
 
+    # Replace an issue's TITLE. Returns { old_title:, issue: } — the previous title is returned because
+    # a retitle is otherwise unrecoverable, and every host reports the change as old → new.
+    #
+    # An empty/whitespace title is refused rather than applied: it means a `--title ""` or a shell
+    # expansion that produced nothing, never "please blank this ticket" (Linear itself accepts a blank
+    # title, leaving an unidentifiable row on the board). Same reasoning — and the same placement, in
+    # the client so every host inherits it — as {#edit_description}'s empty-body guard. The admin
+    # endpoint filters blank titles with `.present?` before it ever gets here, so this is a new refusal
+    # only for the CLI.
     def retitle(identifier, new_title)
+      if new_title.to_s.strip.empty?
+        raise InvalidInput, "Refusing to replace the title with an empty one — pass the new title via --title"
+      end
+
       issue = find_issue!(identifier)
       old_title = issue["title"]
       data = graphql(<<~GQL, { id: issue["id"], title: new_title })

@@ -52,6 +52,8 @@ linear view   ENG-12                             # parent / sub-issues / relatio
 linear list   --status in_progress --team ENG     # EVERY match, paginated; --limit N caps it
 
 linear edit   ENG-12 --desc-file board.md        # REPLACE the description in place (posts no comment)
+linear edit   ENG-12 --title "ENG-12 (Bug): …" --desc-file board.md   # …and/or the title, in one call
+linear retitle ENG-12 "ENG-12 (Bug): …"          # title only (alias: rename)
 
 linear comment        ENG-12 "QA passed"         # or: --body-file notes.md / --body-file - (STDIN)
 linear comments       ENG-12                      # list comment ids

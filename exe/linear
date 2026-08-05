@@ -15,7 +15,7 @@
 # Usage examples:
 #   linear search "<keywords>" [--limit N]
 #   linear create "Title" [--team KEY] [--label Bug|Feature|...] [--priority urgent|high|medium|low] [--desc "body"] ...
-#   linear edit ISSUE-N --desc-file board.md          # replace the description in place (no comment)
+#   linear edit ISSUE-N --title "AGT-1 (Bug): fix X" --desc-file board.md   # replace title/description (no comment)
 #   linear start ISSUE-N --session "..."   |   linear review ISSUE-N --sha <sha>   |   linear close ISSUE-N
 
 require "net/http"
@@ -438,19 +438,33 @@ def cmd_set(args)
   puts res[:url]
 end
 
-# Replace an issue's DESCRIPTION in place — the counterpart to `comment` (AGT-216). The description is
-# the ticket's current state ("now"); comments are how it got here. Flags only, no positional body: a
-# whole-body replace is destructive, so it must be explicit. Rich markdown goes through `--desc-file -`
-# with a SINGLE-quoted heredoc, the same robust path `comment` uses. Prints the char delta so an
-# accidental clobber (3891 → 12) is visible; an empty body is refused by the client, not applied.
+# Replace an issue's TITLE and/or DESCRIPTION in place — the counterpart to `comment` (AGT-216). Both
+# are the ticket's current state ("now"); comments are how it got here. So neither posts a comment, and
+# both live on the same verb: a ticket renamed to the house `TEAM-N (Type): <action>` form once its id
+# is known (AGT-232) is usually being re-described in the same breath, and one `edit` call does it in
+# one command instead of two.
+#
+# Flags only, no positional body: a whole-body replace is destructive, so it must be explicit. Rich
+# markdown goes through `--desc-file -` with a SINGLE-quoted heredoc, the same robust path `comment`
+# uses. Prints the title old → new and the description char delta so an accidental clobber (3891 → 12)
+# is visible; an empty title or body is refused by the client, not applied.
+#
+# The two fields are two mutations (`retitle` + `edit_description`), exactly as the admin endpoint's
+# PATCH runs them — one client, one order, so the CLI and the HTTP surface stay in lock-step. Blank
+# values are therefore caught HERE, before either fires: a `--title ""` that aborted after the
+# description had already been replaced would leave a half-applied edit, and the client's guard alone
+# can only refuse the call it is given.
 def cmd_edit(args)
-  usage = "Usage: #{PROG} edit ISSUE-N --desc \"body\" | --desc-file PATH|-  (--desc-file - reads STDIN)"
+  usage = "Usage: #{PROG} edit ISSUE-N [--title \"New title\"] [--desc \"body\" | --desc-file PATH|-]  " \
+          "(--desc-file - reads STDIN; at least one of --title/--desc)"
   identifier = args.shift or abort usage
+  title = nil
   description = nil
   unknown = []
   i = 0
   while i < args.length
     case args[i]
+    when "--title"                           then title       = args[i + 1]; i += 2
     when "--desc", "--description"           then description = args[i + 1]; i += 2
     when "--desc-file", "--description-file" then description = read_body_file(args[i + 1]); i += 2
     when /\A--/                              then unknown << args[i]; i += 1
@@ -458,14 +472,32 @@ def cmd_edit(args)
     end
   end
   reject_unknown_flags!(unknown, "edit")
-  abort usage if description.nil?
+  abort usage if title.nil? && description.nil?
+  abort "Refusing to replace the title with an empty one — pass the new title via --title" \
+    if title && title.strip.empty?
+  abort "Refusing to replace the description with an empty body — pass the new body via --desc/--desc-file" \
+    if description && description.strip.empty?
 
-  res     = CLIENT.edit_description(identifier, description)
-  updated = res[:issue]
-  puts "#{updated["identifier"]}: description replaced " \
-       "(#{res[:old_description].to_s.length} → #{description.length} chars)"
-  puts updated["url"]
-  warn_dropped_images(updated["identifier"], res[:dropped_images])
+  url = nil
+  if title
+    res     = CLIENT.retitle(identifier, title)
+    updated = res[:issue]
+    url     = updated["url"]
+    puts "#{updated["identifier"]}: \"#{res[:old_title]}\" → \"#{updated["title"]}\""
+  end
+
+  if description
+    res     = CLIENT.edit_description(identifier, description)
+    updated = res[:issue]
+    url     = updated["url"] || url
+    puts "#{updated["identifier"]}: description replaced " \
+         "(#{res[:old_description].to_s.length} → #{description.length} chars)"
+    dropped, dropped_from = res[:dropped_images], updated["identifier"]
+  end
+
+  # One URL for the whole edit, printed last, so a title+desc call reads as one change rather than two.
+  puts url if url
+  warn_dropped_images(dropped_from, dropped) if dropped
 end
 
 # Screenshots live INSIDE the description — `create --image` uploads each one and embeds the markdown in
@@ -840,10 +872,13 @@ def run(argv = ARGV)
         view    ISSUE-N                                shows parent/sub-issues/relations under "Links:"
         url     ISSUE-N
         retitle ISSUE-N "New title"                     change an issue's title (alias: rename); prints old → new
+                └─ renaming to the house TEAM-N (Type): <action> form once the id is known? `edit --title`
+                   does it alongside a --desc replace in one call.
         priority ISSUE-N urgent|high|medium|low|none    change priority (alias: prio); prints old → new
         set     ISSUE-N [--priority X] [--assignee me|email] [--estimate N] [--due YYYY-MM-DD] [--label NAME]   set field(s) in one call
-        edit    ISSUE-N --desc "body" | --desc-file PATH|-   REPLACE the description in place (posts NO comment)
-                └─ description = the current state ("now"); comments = how it got here. Rich markdown? use
+        edit    ISSUE-N [--title "New title"] [--desc "body" | --desc-file PATH|-]   REPLACE the title
+                and/or description in place, in ONE call (posts NO comment)
+                └─ title + description = the current state ("now"); comments = how it got here. Rich markdown? use
                    --desc-file -  with a SINGLE-quoted heredoc:  #{PROG} edit ISSUE-N --desc-file - <<'MD' … MD
         reopen  ISSUE-N [--in-progress] [--comment "why"]   move a Done/Canceled issue back (recurrence)
         parent  CHILD PARENT                  make CHILD a sub-issue of an epic (native hierarchy + rollup)

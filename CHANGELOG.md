@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.9.0] — 2026-08-05
+
+**`edit` now takes `--title`, so a rename and a re-describe are one call (AGT-232).** The house
+convention is that a ticket's title becomes `TEAM-N (Type): <action>` once its id is known — which
+means the rename always happens *after* create, usually in the same breath as filling in the body. The
+CLI made that two commands: `edit ISSUE-N` accepted `--desc`/`--desc-file` only, so `edit --title` died
+on `Unknown flag(s) for edit: --title` (hit for real on AGT-230) and the caller had to know that a
+separate `retitle` verb existed. The admin endpoint's `PATCH /api/v1/admin/linear_issues/{id}` has
+accepted `title` and `desc` together since AGT-216; the CLI, which is what actually files the tickets,
+could not.
+
+- **`linear edit ISSUE-N [--title "New title"] [--desc "body" | --desc-file PATH|-]`** — either flag,
+  or both in one call. At least one is required; `--title` composes with the `--desc-file -` heredoc
+  path exactly as `--desc` does.
+- **Still posts NO comment**, for the same reason a description replace doesn't: a title is the
+  ticket's "now", not how it got here.
+- **Reports title old → new, then the description char delta, then ONE URL**, so a two-field edit reads
+  as one change rather than two.
+- **Two mutations, applied title-first — the same order the admin endpoint's PATCH runs them**, since
+  there is one client by design. Blank values are therefore rejected in the CLI *before* either fires:
+  a `--title ""` caught only by the client would abort after the description had already been replaced,
+  leaving a half-applied edit.
+- **`Linear::Client#retitle` now refuses an empty or whitespace-only title** before the issue lookup,
+  mirroring `#edit_description`'s empty-body guard and for the same reason — a blank title means a
+  `--title ""` or a shell expansion that produced nothing, never "blank this ticket", and Linear itself
+  accepts it and leaves an unidentifiable row on the board. **No host-visible HTTP change:** the admin
+  endpoint already filters blank titles with `.present?`, so the guard only newly binds the CLI. The
+  endpoint's request/response contract is untouched, so `openapi-admin.yaml` does not move.
+- **`retitle` / `rename` are unchanged and stay** — the single-purpose verb for a title-only rename
+  (it has existed since v1.0.0; the gap AGT-232 filed was `edit --title`, not the mutation, which is
+  why no new GraphQL was needed here).
+
 ## [2.8.2] — 2026-08-04
 
 **One serializer, two queries, and only one of them selected `state.type` (AGT-230).** `#search` asked

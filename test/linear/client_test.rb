@@ -586,6 +586,20 @@ class Linear::ClientTest < LinearCli::TestCase
     end
   end
 
+  # --- title replace (AGT-232) ----------------------------------------------
+  # An empty title is the same class of accident as an empty body: a `--title ""` or a shell expansion
+  # that produced nothing. Linear itself accepts it and leaves an unidentifiable row on the board, so
+  # the refusal lives here, where both hosts inherit it. (The admin endpoint's `.present?` already
+  # filtered blanks, so this only newly binds the CLI.)
+  test "retitle refuses an empty or whitespace-only title before any network call" do
+    client.stub(:find_issue!, ->(_id) { flunk "must refuse an empty title before resolving the issue" }) do
+      ["", "   \n\t ", nil].each do |blank|
+        err = assert_raises(Linear::Client::InvalidInput) { client.retitle("AGT-1", blank) }
+        assert_match(/empty one/, err.message)
+      end
+    end
+  end
+
   # --- description replace (AGT-216) ----------------------------------------
   # `edit_description` is the write half of "description = now, comments = how it got here". It rides
   # the existing #update_issue mutation path (one new field, no new plumbing) and must never post a
