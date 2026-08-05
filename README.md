@@ -56,7 +56,7 @@ linear edit   ENG-12 --title "ENG-12 (Bug): …" --desc-file board.md   # …and
 linear retitle ENG-12 "ENG-12 (Bug): …"          # title only (alias: rename)
 
 linear comment        ENG-12 "QA passed"         # or: --body-file notes.md / --body-file - (STDIN)
-linear comments       ENG-12                      # list comment ids
+linear comments       ENG-12                      # WHOLE thread oldest-first, paginated; comment ids
 linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md / -
 linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comment
 ```
@@ -69,6 +69,13 @@ and `--label` is filtered by Linear rather than applied to a page already thrown
 the oldest N and would rather not page a whole team for them; without it you get everything. If the
 10,000-issue safety ceiling is ever reached, `list` says so on **stderr** and labels the rows
 `INCOMPLETE` — a short list is never returned in silence.
+
+**`comments` and `view` return the whole thread, oldest-first.** The same cap bit comments one page
+further out: the query asked for 250 and stopped there, and because Linear serves comments
+**newest-first**, what fell off past 250 were the **oldest** ones — so `.first` quietly meant
+"250th-newest". That is five days of a ticket commented on every half hour, not a hypothetical.
+`comments` now pages to exhaustion behind the same ceiling and the same `INCOMPLETE` stderr warning as
+`list`.
 
 **`edit` vs `comment`** — an issue's *description* is **now** (the current state, rewritten in place);
 its *comments* are **how it got here**. `edit` replaces the whole description and never posts a
