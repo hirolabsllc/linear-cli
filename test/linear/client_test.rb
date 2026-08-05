@@ -465,6 +465,131 @@ class Linear::ClientTest < LinearCli::TestCase
     assert_operator Linear::Client::MAX_PAGE_SIZE, :<=, 250, "251 is an Argument Validation Error at Linear"
   end
 
+  # --- comment pagination (AGT-233) -----------------------------------------
+
+  # A fake `comments` connection over `total` comments, served NEWEST-first the way Linear serves them
+  # and walked by the same `after:`/`endCursor` contract.
+  #
+  # The newest-first build is the whole point. Page one is the newest {MAX_PAGE_SIZE} comments, so what
+  # a client that never follows the cursor silently drops is the OLDEST end — and after the ascending
+  # sort that makes `.first` mean "250th-newest" rather than "oldest", with nothing short or wrong-looking
+  # to notice. Feeding this fixture ascending would hide exactly that, which is why AGT-217's fixtures
+  # are newest-first too.
+  class FakeComments
+    attr_reader :calls
+
+    def initialize(total:)
+      @rows = total.downto(1).map do |n|
+        { "id" => "c#{n}", "body" => "comment #{n}", "user" => { "name" => "A" },
+          # Monotonic in n, so the ascending sort has a real timestamp to work from rather than ties.
+          "createdAt" => format("2026-07-30T%02d:%02d:%02d.000Z", n / 3600, (n / 60) % 60, n % 60) }
+      end
+      @calls = []
+    end
+
+    def to_proc = ->(query, vars) { serve(query, vars) }
+
+    private
+
+    def serve(query, vars)
+      @calls << vars.merge(query: query)
+      # Cursors are opaque to the client, so the offset is encoded in one: a client that ignores
+      # endCursor re-reads page one forever and the id assertions below catch it.
+      offset = vars[:after].to_s.empty? ? 0 : vars[:after].to_s.delete_prefix("cursor-").to_i
+      page   = @rows[offset, vars[:first].to_i] || []
+      seen   = offset + page.length
+      { "issue" => { "comments" => {
+        "nodes" => page,
+        "pageInfo" => { "hasNextPage" => seen < @rows.length, "endCursor" => "cursor-#{seen}" }
+      } } }
+    end
+  end
+
+  # The bug. One `first: 250` query returned the newest 250 and nothing else — no error, no marker, a
+  # list that looks perfectly healthy. The total spans three pages so the walk, not just a bigger single
+  # page, is what is being proved. A board ticket ticking every ~30 min reaches this in about five days.
+  test "comments walks the whole thread instead of returning Linear's newest page" do
+    total = (Linear::Client::MAX_PAGE_SIZE * 2) + 137
+    fake  = FakeComments.new(total: total)
+    client.stub(:graphql, fake.to_proc) do
+      list = client.comments("AGT-1")
+      assert_equal total, list.length, "a #{total}-comment thread must return #{total} comments, not one page"
+      assert_equal (1..total).map { |n| "c#{n}" }, list.map { |c| c["id"] },
+                   "every page must be concatenated and sorted oldest-first, none repeated or dropped"
+      assert_equal 3, fake.calls.length, "#{total} comments span three pages — the cursor must be followed"
+    end
+  end
+
+  # The failure mode in one assertion: `.first` must be the OLDEST comment on the issue, not the oldest
+  # of the newest page. Truncation moves it silently — c388 is a real comment with a real timestamp, so
+  # nothing downstream can tell it apart from the true first one.
+  test "comments .first is the thread's oldest comment even past one page" do
+    total = Linear::Client::MAX_PAGE_SIZE + 1
+    client.stub(:graphql, FakeComments.new(total: total).to_proc) do
+      list = client.comments("AGT-1")
+      assert_equal "c1", list.first["id"], ".first must be the OLDEST comment, not the #{total}th-newest"
+      assert_equal "c#{total}", list.last["id"], ".last must still be the NEWEST comment"
+    end
+  end
+
+  test "comments sends an explicit first: and asks for pageInfo" do
+    fake = FakeComments.new(total: 600)
+    client.stub(:graphql, fake.to_proc) do
+      client.comments("AGT-1")
+      assert_equal [nil, "cursor-250", "cursor-500"], fake.calls.map { |c| c[:after] },
+                   "each request after the first must carry the previous page's endCursor"
+      assert_equal Linear::Client::MAX_PAGE_SIZE, fake.calls.first[:first]
+      assert_includes fake.calls.first[:query], "pageInfo",
+                      "without pageInfo the client cannot know the thread continues past this page"
+      assert_includes fake.calls.first[:query], "hasNextPage"
+      assert_includes fake.calls.first[:query], "endCursor"
+    end
+  end
+
+  test "comments makes exactly one request when the first page is the whole thread" do
+    fake = FakeComments.new(total: 12)
+    client.stub(:graphql, fake.to_proc) do
+      assert_equal 12, client.comments("AGT-1").length
+      assert_equal 1, fake.calls.length, "hasNextPage: false must end the walk"
+    end
+  end
+
+  # Same guard `#list` needed (AGT-224): `hasNextPage: true` with nothing to follow would re-request
+  # page one until the ceiling, quietly multiplying the same comments.
+  test "comments treats a blank endCursor as the end of the connection" do
+    calls = 0
+    stuck = ->(_query, _vars) do
+      calls += 1
+      { "issue" => { "comments" => { "nodes" => [{ "id" => "c1", "createdAt" => "2026-07-30T11:00:00.000Z" }],
+                                     "pageInfo" => { "hasNextPage" => true, "endCursor" => nil } } } }
+    end
+    client.stub(:graphql, stuck) do
+      assert_equal %w[c1], client.comments("AGT-1").map { |c| c["id"] }
+    end
+    assert_equal 1, calls, "a hasNextPage with no cursor must not re-request page one"
+  end
+
+  # A connection that never reports an end must stop AND say so. Returning a short thread in silence is
+  # the defect being fixed, so the ceiling cannot reintroduce it.
+  test "comments stops at the page ceiling and reports the truncation on stderr" do
+    calls = 0
+    endless = ->(_query, vars) do
+      calls += 1
+      nodes = Array.new(vars[:first].to_i) { |i| { "id" => "c#{calls}-#{i}", "createdAt" => "2026-07-30T11:00:00.000Z" } }
+      { "issue" => { "comments" => { "nodes" => nodes,
+                                     "pageInfo" => { "hasNextPage" => true, "endCursor" => "cursor-#{calls}" } } } }
+    end
+
+    list = nil
+    _out, err = capture_io { client.stub(:graphql, endless) { list = client.comments("AGT-1") } }
+
+    assert_equal Linear::Client::MAX_LIST_PAGES, calls, "a connection that never ends must not loop forever"
+    assert_equal Linear::Client::MAX_LIST_PAGES * Linear::Client::MAX_PAGE_SIZE, list.length,
+                 "everything fetched before the ceiling is still returned"
+    assert_match(/TRUNCATED/, err, "hitting the ceiling must never be silent")
+    assert_match(/INCOMPLETE/, err)
+  end
+
   test "comments returns an empty array for an issue with no comments" do
     client.stub(:graphql, ->(*_a) { { "issue" => { "comments" => { "nodes" => [] } } } }) do
       assert_empty client.comments("AGT-1")

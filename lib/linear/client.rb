@@ -588,10 +588,9 @@ module Linear
     # discover comment ids), so a mistaken comment can be edited or deleted.
 
     # Maximum `first:` Linear accepts on a connection — 251 is an "Argument Validation Error" (measured
-    # 2026-07-30). {#comments} asks for the whole page rather than letting Linear default to 50, because
-    # a truncated window silently breaks the oldest-first contract below: sorting the newest 50 ascending
-    # would make `.first` mean "50th-newest", which is the same species of silently-wrong answer as the
-    # ordering bug itself (AGT-217).
+    # 2026-07-30). Every connection walk asks for the whole page rather than letting Linear default to 50,
+    # because a truncated window is indistinguishable from a genuinely short result: see {#paginate} for
+    # why one page is never enough on its own, and {MAX_LIST_PAGES} for where the walk stops.
     MAX_PAGE_SIZE = 250
 
     # List an issue's comments **oldest-first** — `.first` is the oldest comment, `.last` is the newest —
@@ -616,17 +615,34 @@ module Linear
     #     relying on that implicit default is precisely what let the doc and the behaviour drift apart
     #     unnoticed. `id` breaks ties so the order is deterministic (Ruby's `sort_by` is not stable) when
     #     two comments share a `createdAt`.
+    #
+    # **Paginated to exhaustion (AGT-233), for the same reason the sort exists.** This issued ONE
+    # `first: MAX_PAGE_SIZE` query and returned whatever came back, which is the AGT-217 bug moved to a
+    # higher threshold rather than fixed: Linear returns comments newest-first, so past a page the OLDEST
+    # are what falls off, and after the ascending sort `.first` silently means "250th-newest" instead of
+    # "oldest". Nothing raises and nothing looks short. 250 is reachable in about five days — a board or
+    # `verify-queue` ticket ticking every ~30 min accrues ~48 comments/day, and those long-lived tickets
+    # are exactly the ones someone asks "what did the last tick say" about. All three callers read the
+    # whole list (`cmd_comments` and `cmd_view` display it, `ensure_comment_on_issue!` matches by id), so
+    # full pagination is the right default rather than a flag.
     def comments(identifier)
-      data = graphql(<<~GQL, { id: identifier, first: MAX_PAGE_SIZE })
-        query($id: String!, $first: Int!) {
-          issue(id: $id) {
-            comments(first: $first, orderBy: createdAt) { nodes { id body createdAt user { name } } }
+      nodes = paginate(label: "comments #{identifier}",
+                       remedy: "the OLDEST comments on #{identifier} are missing — raise " \
+                               "Linear::Client::MAX_LIST_PAGES.") do |want, cursor|
+        data = graphql(<<~GQL, { id: identifier, first: want, after: cursor })
+          query($id: String!, $first: Int!, $after: String) {
+            issue(id: $id) {
+              comments(first: $first, after: $after, orderBy: createdAt) {
+                nodes { id body createdAt user { name } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
           }
-        }
-      GQL
-      raise NotFound, "Issue #{identifier} not found" if data["issue"].nil?
+        GQL
+        raise NotFound, "Issue #{identifier} not found" if data["issue"].nil?
 
-      nodes = data.dig("issue", "comments", "nodes") || []
+        data.dig("issue", "comments")
+      end
       nodes.sort_by { |c| [c["createdAt"].to_s, c["id"].to_s] }
     end
 
@@ -828,9 +844,10 @@ module Linear
       data.dig("searchIssues", "nodes") || []
     end
 
-    # Pages {#list} will walk before it gives up — 40 × {MAX_PAGE_SIZE} = 10,000 issues, far above any
-    # real team (AKA, the largest here, holds 1,597 in total) and low enough that a pathological filter
-    # cannot spin forever. Hitting it is reported on stderr, never absorbed: see {#list}.
+    # Pages any connection walk ({#list}, {#comments}) will make before it gives up — 40 × {MAX_PAGE_SIZE}
+    # = 10,000 nodes, far above any real team (AKA, the largest here, holds 1,597 issues in total) or
+    # thread, and low enough that a pathological query cannot spin forever. Hitting it is reported on
+    # stderr, never absorbed: see {#paginate}.
     MAX_LIST_PAGES = 40
 
     # List team issues, optionally filtered by lifecycle status and/or label name. Returns nodes in
@@ -880,12 +897,10 @@ module Linear
       # cannot.
       filter[:labels] = { name: { eqIgnoreCase: label.to_s } } if label
 
-      issues = []
-      cursor = nil
-      pages  = 0
-      loop do
-        want = limit ? [limit - issues.length, MAX_PAGE_SIZE].min : MAX_PAGE_SIZE
-        data = graphql(<<~GQL, { filter: filter, first: want, after: cursor })
+      paginate(label: "list", limit: limit,
+               remedy: "narrow the query (--status / --label / --team) or raise " \
+                       "Linear::Client::MAX_LIST_PAGES.") do |want, cursor|
+        graphql(<<~GQL, { filter: filter, first: want, after: cursor })["issues"]
           query($filter: IssueFilter!, $first: Int!, $after: String) {
             issues(filter: $filter, orderBy: createdAt, first: $first, after: $after) {
               nodes {
@@ -897,29 +912,7 @@ module Linear
             }
           }
         GQL
-        conn = data["issues"] || {}
-        issues.concat(conn["nodes"] || [])
-        pages += 1
-        break if limit && issues.length >= limit
-
-        info   = conn["pageInfo"] || {}
-        cursor = info["endCursor"].to_s
-        # `hasNextPage` with no cursor to follow would re-request page one forever, so a blank
-        # `endCursor` ends the connection.
-        break unless info["hasNextPage"] && !cursor.empty?
-
-        if pages >= MAX_LIST_PAGES
-          # Say so, loudly, on stderr. Returning a short list in silence IS the defect this method was
-          # filed for — a wrong count that announces itself is recoverable, one that doesn't is not. The
-          # ceiling sits high enough that a real board cannot reach it, so if this ever fires the caller
-          # genuinely needs to know the numbers below are incomplete.
-          warn "[linear] list TRUNCATED: stopped at the #{MAX_LIST_PAGES}-page ceiling with " \
-               "#{issues.length} issues and Linear reporting more. These rows are INCOMPLETE — " \
-               "narrow the query (--status / --label / --team) or raise Linear::Client::MAX_LIST_PAGES."
-          break
-        end
       end
-      limit ? issues.first(limit) : issues
     end
 
     # --- file upload (GraphQL half only) ------------------------------------
@@ -940,6 +933,50 @@ module Linear
     end
 
     private
+
+    # Walk a Relay-style connection to exhaustion and return every node, concatenated in the order the
+    # pages arrived. The block receives `(first, after)` and issues one request, returning that page's
+    # connection hash — `{ "nodes" => [...], "pageInfo" => { "hasNextPage", "endCursor" } }` — or nil.
+    #
+    # **Shared because this is the second connection in one week to be silently truncated** ({#list},
+    # AGT-224; {#comments}, AGT-233), and both times the symptom was the same: Linear caps an unpaginated
+    # connection at 50 nodes with no marker on the response and no error, so a truncated result is
+    # byte-for-byte indistinguishable from a genuinely short one. Re-deriving this walk per connection is
+    # what let the second one ship without it; a third should call this rather than write the loop again.
+    #
+    # `limit:` caps the nodes AND stops the walk as soon as it has them, so a caller that wants 10 rows
+    # makes one request asking for 10 rather than paging a 1,600-issue team and discarding the rest.
+    # `remedy:` completes the ceiling warning with what the caller can actually do about it.
+    def paginate(label:, remedy:, limit: nil)
+      nodes  = []
+      cursor = nil
+      pages  = 0
+      loop do
+        want = limit ? [limit - nodes.length, MAX_PAGE_SIZE].min : MAX_PAGE_SIZE
+        conn = yield(want, cursor) || {}
+        nodes.concat(conn["nodes"] || [])
+        pages += 1
+        break if limit && nodes.length >= limit
+
+        info   = conn["pageInfo"] || {}
+        cursor = info["endCursor"].to_s
+        # `hasNextPage` with no cursor to follow would re-request page one forever, so a blank
+        # `endCursor` ends the connection. An absent `pageInfo` ends it too — a caller that selected no
+        # page info has asked for one page.
+        break unless info["hasNextPage"] && !cursor.empty?
+
+        if pages >= MAX_LIST_PAGES
+          # Say so, loudly, on stderr. Returning a short result in silence IS the defect both callers
+          # were filed for — a wrong count that announces itself is recoverable, one that doesn't is not.
+          # The ceiling sits high enough that no real board or thread can reach it, so if this ever fires
+          # the caller genuinely needs to know what came back is incomplete.
+          warn "[linear] #{label} TRUNCATED: stopped at the #{MAX_LIST_PAGES}-page ceiling with " \
+               "#{nodes.length} rows and Linear reporting more. This result is INCOMPLETE — #{remedy}"
+          break
+        end
+      end
+      limit ? nodes.first(limit) : nodes
+    end
 
     def link_result(kind, ref, issue_node, ok)
       { kind: kind, ref: ref, identifier: issue_node && issue_node["identifier"], ok: !!ok }

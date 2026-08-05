@@ -1,5 +1,38 @@
 # Changelog
 
+## [2.10.0] — 2026-08-05
+
+**`comments` now walks the whole thread instead of returning Linear's newest 250 (AGT-233).**
+`Linear::Client#comments` issued ONE `first: 250` query with no cursor walk and returned whatever came
+back. Linear serves comments **newest-first**, so past 250 the **oldest** are what falls off — and
+because the method then sorts ascending (AGT-217), `.first` silently meant "250th-newest" rather than
+"oldest". Nothing raised, nothing looked short: a truncated thread is byte-for-byte indistinguishable
+from a genuinely short one. This is the AGT-217 ordering bug moved to a higher threshold, not fixed.
+
+- **250 is reachable in about five days, not theoretical.** A board or `verify-queue` ticket ticking
+  every ~30 min accrues ~48 comments/day — and those long-lived tickets are exactly the ones someone
+  asks "what did the last tick say" about, which is the question AGT-217 existed to make answerable.
+- **Full pagination is the default, not a flag.** All three callers read the whole list — `cmd_comments`
+  and `cmd_view` display it, `ensure_comment_on_issue!` matches by id.
+- **Capped at the same 40-page ceiling `list` uses**, and hitting it warns on stderr naming the OLDEST
+  comments as the missing end. A pathological thread cannot spin; a truncated one cannot stay quiet.
+
+**The paging walk is now one shared private helper, `Linear::Client#paginate` — `list` and `comments`
+both call it.** This was the **second** connection in one week silently truncated by Linear's implicit
+page size (`list`, AGT-224; `comments`, AGT-233), and re-deriving the loop per connection is what let
+the second one ship without it. The helper carries the `hasNextPage`/`endCursor` walk, the blank-cursor
+guard (a `hasNextPage` with no cursor would re-request page one forever), the `limit:` early stop, and
+the ceiling warning. **No behaviour change to `list`** — verified against live Linear before and after
+the refactor: identical row counts for `--status in_progress` (102), `--limit 3` (3) and `--label Bug`
+(463).
+
+**Tests.** There was no truncation test for `comments`; there are now six, over a fake connection built
+**newest-first** the way Linear serves it — feeding a pre-sorted fixture is precisely what let the
+original ordering bug pass unnoticed, so the AGT-217 fixtures keep that shape too. All four of the
+behavioural ones fail against the previous release (`.first` returns `c2` on a 251-comment thread).
+The multi-page walk was also exercised end-to-end against live Linear with the page size forced to 2:
+3 real cursor round-trips, 6 unique comments, ascending, identical to the single-page result.
+
 ## [2.9.0] — 2026-08-05
 
 **`edit` now takes `--title`, so a rename and a re-describe are one call (AGT-232).** The house
