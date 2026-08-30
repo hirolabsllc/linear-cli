@@ -1,5 +1,68 @@
 # Changelog
 
+## [2.17.0] — 2026-08-30
+
+**The staleness check can finally see a tag the checkout has never fetched (AGT-231).**
+
+[AGT-222](https://linear.app/hgl-ai/issue/AGT-222) (v2.8.0/v2.8.1) shipped the stale-checkout warning
+as a **local-only** comparison: `LinearCli::VERSION` against the newest `vX.Y.Z` tag *the checkout
+already has*. That is correct and cheap for a clone releases are tagged from — a worktree shares the
+ref store, so the tag exists there the instant it is cut — and it was measured firing correctly there.
+It is **blind on a checkout nobody ever fetches**, which is the one surface that most needed it.
+Demonstrated during AGT-222's own rollout:
+
+```
+# box detached at v2.8.1, v2.8.2 already tagged on origin, box had not fetched
+$ ruby -I /opt/linear-cli/lib -r linear_cli \
+    -e 'puts LinearCli::Checkout.warnings(root: "/opt/linear-cli")'
+(no output)
+```
+
+A tag you have never fetched does not exist as far as `git tag` is concerned — which is how that box
+once reached **four releases / 45 days** behind ([AGT-218](https://linear.app/hgl-ai/issue/AGT-218)).
+The payload got worse in v2.16.0: [AGT-275](https://linear.app/hgl-ai/issue/AGT-275) fixed
+`linear commit ISSUE-N --sah abc` falling back to `HEAD` and posting **the wrong commit onto a ticket
+as fact**. A stale box does not merely lack features; it writes wrong provenance into Linear.
+
+The newest tag is now the newer of the local one and a **cached** `git ls-remote --tags origin`, and
+the warning names where it saw it:
+
+```
+  ! linear_cli 2.16.0 is behind v2.17.0 on origin — this checkout is serving old code (AGT-231)
+    fix: cd /opt/linear-cli && git fetch --tags origin && git checkout --detach v2.17.0
+```
+
+**Nothing about the advisory contract changes.** The check still prints to stderr before the command
+runs, still never blocks it, still never exits non-zero:
+
+| | |
+|---|---|
+| the lookup runs | **detached**, at most once per TTL (12 h), never waited on |
+| cost with the lookup **stalled 3000 ms** | **31 ms** — the caller waits for the spawn, not the network |
+| cost on the healthy hot path | median **29.2 ms**, vs **29.2 ms** before this change (30 samples, two rounds) |
+| offline / no `origin` / DNS failure | silent; the **attempt** is stamped before the spawn, so the box backs off a full TTL instead of piling up one stalled `git` per invocation |
+| malformed or truncated cache | falls back to the local answer; never raises |
+| cache location | the checkout's git dir — removed with the clone, no new global state |
+| credentials | none. `ls-remote` on a public repo over https, with credential helpers and terminal prompts **disabled** for the call (an auth prompt is a hang) |
+| repo lock | none — safe against the 3–6 concurrent sessions sharing a clone |
+
+Two checkouts deliberately make **no network call at all**: one with no release tags (nothing there
+defines "current" — this is what keeps bundler's vendored copy silent), and bundler's install layout,
+whose version is fixed by the Gemfile pin and whose update already fails loudly through the lock and
+the deploy. New knobs: `LINEAR_CLI_SKIP_REMOTE_CHECK=1` drops the network half while keeping the local
+one; `LINEAR_CLI_REMOTE_TTL=<seconds>` overrides the 12 h.
+
+One real-data trap worth naming: `git ls-remote` output is sorted **lexically**, so on the live repo
+the last line is `refs/tags/v2.9.0` while the version max is `refs/tags/v2.16.0`. Tags are compared as
+versions, never as strings.
+
+Covered by `test/linear_cli/checkout_test.rb` (31 tests), which runs fully offline — `git` is stubbed
+by a `PATH` shim that logs every invocation and delegates to the real git for everything except
+`ls-remote`, so the real spawn, detachment, atomic cache write and parse all stay under test and
+"how many network calls did this make?" is countable. Pointed at the pre-fix module via
+`LINEAR_CLI_LIB`, it reports **7 failures against v2.16.0** and **0 against this one**; the other 24
+are paired controls and pass on both sides by design.
+
 ## [2.16.0] — 2026-08-30
 
 **The flag loops that had no guard at all (AGT-275).** [AGT-209](https://linear.app/hgl-ai/issue/AGT-209)

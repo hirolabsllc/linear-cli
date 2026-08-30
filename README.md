@@ -235,13 +235,10 @@ It lives in the gem (`LinearCli::Checkout`, called from `exe/linear`), not in ea
 so every shim inherits it — the shims stay thin. The fix line matches the checkout's shape: a detached
 HEAD is a pinned box, so it is told to move the pin to the new tag.
 
-The check is **local-only and never touches the network**: one or two `git` invocations (~10–20 ms
-against a 200 ms+ API round-trip), no credentials, nothing that can hang. Consequences of that choice:
+The check **never blocks and never fails the command**: one or two `git` invocations (~29 ms against a
+200 ms+ API round-trip), nothing that can hang, and an advisory line on stderr either way. Consequences
+of that choice:
 
-- It **cannot see a tag the checkout has never fetched.** For a clone a release was tagged from, that
-  is a non-issue — a worktree shares the clone's ref store, so the tag exists there the instant it is
-  cut — and a pinned checkout's update recipe opens with `fetch --tags` anyway. Closing it for a box
-  nobody ever fetches needs a cached `git ls-remote`; see AGT-220.
 - **Under bundler** it never cries wolf and never misdirects. Bundler's vendored checkout carries a
   permanently modified `linear_cli.gemspec` — bundler rewrites it in place — which is why only `lib/`
   and `exe/` count as dirty. And when the `Gemfile` pin genuinely *is* behind, the fix offered is to
@@ -252,6 +249,42 @@ against a 200 ms+ API round-trip), no credentials, nothing that can hang. Conseq
 
 Silence it with `LINEAR_CLI_SKIP_CHECKOUT_CHECK=1` (a box held back on purpose, or a caller that parses
 stderr).
+
+### A tag the checkout has never fetched
+
+Until v2.17.0 the comparison was **local-only**: the newest `vX.Y.Z` tag *this checkout already has*.
+That is exactly right for a clone releases are tagged from — a worktree shares the ref store, so the tag
+exists there the instant it is cut — and it was measured working there. It is **blind on a checkout
+nobody ever fetches**, which is the shape that needed it most. Measured during v2.8.x's own rollout: a
+pinned box detached at `v2.8.1`, `v2.8.2` already tagged on origin, and `Checkout.warnings` printed
+nothing. A tag you have never fetched does not exist as far as `git tag` is concerned — which is how
+that box once reached four releases / 45 days behind.
+
+Since v2.17.0 the newest tag is the newer of the local one and a **cached** `git ls-remote --tags
+origin` (AGT-231), and the warning says where it saw it:
+
+```
+  ! linear_cli 2.16.0 is behind v2.17.0 on origin — this checkout is serving old code (AGT-231)
+    fix: cd /opt/linear-cli && git fetch --tags origin && git checkout --detach v2.17.0
+```
+
+The lookup is **detached and never waited on**, so the guarantee above is unchanged:
+
+- it runs **at most once per TTL** (12 h), keyed off a cache file in the checkout's git dir — so it is
+  removed with the clone and adds no global state;
+- **nothing waits on it.** Measured: with the lookup stalled 3000 ms, the invocation that started it
+  still returned in ~31 ms. Drift becomes visible on the *next* invocation rather than the first, which
+  on a box calling `linear` dozens of times an hour is seconds later;
+- the **attempt** is recorded before the lookup starts, so an offline box backs off a full TTL instead
+  of spawning one stalled `git` per invocation, and degrades silently to the local-only behaviour;
+- `ls-remote` is read-only and takes **no repo lock**, so it is safe against concurrent sessions sharing
+  a clone, and needs **no credential** for a public repo over https. Credential helpers and terminal
+  prompts are disabled for the call outright — an auth prompt would be a hang.
+- **bundler's vendored copy is excluded** and makes no network call at all: its version is fixed by the
+  Gemfile pin, whose update already fails loudly through the lock and the deploy.
+
+Two knobs: `LINEAR_CLI_SKIP_REMOTE_CHECK=1` drops the network half while keeping the local one (an
+air-gapped box), and `LINEAR_CLI_REMOTE_TTL=<seconds>` overrides the 12 h.
 
 ## License
 
