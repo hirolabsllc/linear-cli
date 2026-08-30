@@ -335,9 +335,16 @@ end
 # preferring one would be the same quiet wrong-body class this whole guard exists for (AGT-267).
 def resolve_comment_flags!(comment, comment_file)
   abort "Pass either --comment or --comment-file, not both." if comment && comment_file
-  return comment unless comment_file
 
-  read_body_file(comment_file)
+  flag, body = comment_file ? ["--comment-file", read_body_file(comment_file)] : ["--comment", comment]
+  # A blank body reaching the client is a no-op there (`add_comment if comment && !comment.empty?`),
+  # so the command would print its success line AND "Comment added." having attached nothing — the
+  # exact false signal this pair of tickets exists to remove, just reached by a different door (an
+  # empty heredoc, a generated file that came out empty). Asking again costs a retry; a Done ticket
+  # with a missing writeup costs the writeup.
+  abort "#{PROG}: #{flag} was given but the body is empty." if body && body.strip.empty?
+
+  body
 end
 
 # Human-readable parent / sub-issue / relation lines for an issue node returned by

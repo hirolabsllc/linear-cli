@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.12.1] — 2026-08-30
+
+**A blank comment body no longer reports a comment it did not attach (AGT-209, AGT-267).**
+
+v2.12.0 closed the wrong-flag door and left one open next to it. `Linear::Client#transition` attaches
+a comment only `if comment && !comment.to_s.empty?`, so `close ISSUE-N --comment-file empty.md` — an
+empty heredoc, or a generated body file that came out empty — printed:
+
+```
+Closed ISSUE-N: … → Done
+Comment added.                # ← attached nothing, exit 0
+```
+
+which is the AKA-2656 failure verbatim, reached through a different door. `--comment` and
+`--comment-file` now abort when the body they resolve to is blank, naming which flag was empty, and
+the issue does not transition. A retry costs one command; a Done ticket with a missing writeup costs
+the writeup.
+
 ## [2.12.0] — 2026-08-30
 
 **The transition subcommands stopped swallowing unrecognized flags, and `close`/`cancel`/`reopen`

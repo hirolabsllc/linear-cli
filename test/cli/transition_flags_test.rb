@@ -2,6 +2,7 @@
 
 require "test_helper"
 require "stringio"
+require "tempfile"
 
 # Load exe/linear ONCE, with the autorun disabled, so its top-level cmd_* helpers are callable here
 # without running a command or touching the network (same pattern as cli/comment_body_test.rb).
@@ -231,6 +232,27 @@ class CliTransitionFlagsTest < LinearCli::TestCase
                             stub: :relate, returns: RELATE_RESULT)
     refute aborted, "relate --type must still be accepted"
     assert_equal "blocks", calls.first[1][:type]
+  end
+
+  # A body that resolves to blank is a no-op at the client, so the command used to print its success
+  # line AND "Comment added." having attached nothing — the same false signal, reached by an empty
+  # heredoc or a generated file that came out empty rather than by a wrong flag.
+  test "close --comment-file with an empty body aborts instead of reporting a comment it did not attach" do
+    Tempfile.create(["empty", ".md"]) do |f|
+      f.write("   \n\n")
+      f.flush
+      calls, aborted, err = drive(:cmd_close, ["ISSUE-1", "--comment-file", f.path])
+      assert aborted, "an empty body must abort, not close the issue with nothing attached"
+      assert_match(/--comment-file was given but the body is empty/, err)
+      assert_empty calls
+    end
+  end
+
+  test "close --comment with an empty string aborts for the same reason" do
+    calls, aborted, err = drive(:cmd_close, ["ISSUE-1", "--comment", "  "])
+    assert aborted
+    assert_match(/--comment was given but the body is empty/, err)
+    assert_empty calls
   end
 
   # A value-taking flag left dangling at the end of ARGV bound nil and carried on silently — the same
