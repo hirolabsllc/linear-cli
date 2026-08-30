@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.13.0] — 2026-08-30
+
+**BEHAVIOUR CHANGE — `review` no longer claims a deploy for any repo unless you configure one
+(AGT-270).** The built-in deploy allowlist is now empty:
+
+```ruby
+DEFAULT_DEPLOY_REPOS = {}.freeze   # was { "<one private repo>" => "<its platform>" }
+```
+
+v2.11.0 (AGT-212) stopped `review` claiming a merge or a deploy it could not prove, and made the
+deploy claim configurable via `$LINEAR_CLI_DEPLOY_REPOS` — but shipped one specific repo, and the
+platform it deploys to, wired in as the **default**. A fresh install of a public gem, with nothing
+configured, would append `— <Platform> deploy in progress` to a Linear comment the moment it ran
+from a checkout of that repo. That sentence lands on a ticket's permanent audit trail, and no
+install outside the one workspace can want it. Nothing this tool ships can know which repos deploy
+or what they deploy to, so it now claims nothing until told.
+
+**If you were relying on the implicit default, set it yourself** — in your own `.env`, not in this
+gem:
+
+```bash
+LINEAR_CLI_DEPLOY_REPOS=owner/name=Platform
+```
+
+That is the point of the change: the coupling becomes explicit and lives in the consumer that knows
+it is true. No capability is lost — `--deploy` / `--no-deploy` already assert or withdraw the clause
+per call, and `$LINEAR_CLI_DEPLOY_REPOS` already replaced the list wholesale. The deploy clause just
+stops being opt-*out*. Unset and empty now mean the same thing: nothing deploys.
+
+Everything else about the clause is unchanged: it still appears only for a repo on the list, only
+once the commit is actually on origin's default branch, and it still follows the **resolved** repo
+rather than the working directory.
+
+The rationale comments in `exe/linear` that stated these rules through the names of specific private
+repos now state the same mechanism generically; the ticket ids stay, since they are the trail back
+to the full story.
+
 ## [2.12.1] — 2026-08-30
 
 **A blank comment body no longer reports a comment it did not attach (AGT-209, AGT-267).**

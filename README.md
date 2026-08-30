@@ -36,7 +36,7 @@ Ruby **3.4.9** is pinned via `.ruby-version` (rbenv auto-selects it in the repo 
 |---|---|---|
 | `LINEAR_API_KEY` | yes | Linear personal API key — get one at <https://linear.app/settings/api> |
 | `LINEAR_DEFAULT_TEAM` | no | Default team key for `create` / `list` (e.g. `ENG`). A per-command `--team KEY` always wins. With neither set, `create` / `list` raise a clear error. |
-| `LINEAR_CLI_DEPLOY_REPOS` | no | Which repos `review` may describe as deploying: `owner/name[=Platform]`, comma-separated. Defaults to `gtyler/trader-ai=Hatchbox`; an empty value means nothing deploys. |
+| `LINEAR_CLI_DEPLOY_REPOS` | no | Which repos `review` may describe as deploying: `owner/name[=Platform]`, comma-separated (e.g. `octocat/hello-world=Kamal`). **No default** — unset or empty means nothing deploys, and `review` emits no deploy clause. Per-call, `--deploy` / `--no-deploy` override it. |
 
 If the `dotenv` gem is available, a `.env` in the working directory is auto-loaded (so it "just
 works" inside a project checkout). On servers, export the vars directly.

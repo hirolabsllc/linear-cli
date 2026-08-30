@@ -105,6 +105,12 @@ class CliCommitLinkTest < LinearCli::TestCase
     body
   end
 
+  # AGT-270: the built-in allowlist is empty, so nothing deploys unless the caller says so. A test
+  # that wants the deploy clause configures it the way a consumer now has to — in the environment.
+  def deploying(slug, platform = "Hatchbox")
+    ENV["LINEAR_CLI_DEPLOY_REPOS"] = platform ? "#{slug}=#{platform}" : slug.to_s
+  end
+
   def commit_body(root, args)
     body = nil
     CLIENT.stub(:comment, ->(_id, b) { body = b }) do
@@ -134,6 +140,7 @@ class CliCommitLinkTest < LinearCli::TestCase
     # correctly, so nothing is linked.
     trader, = checkout(slug: TRADER, path: "trader-ai")
     _tk, _landed, foreign = checkout(slug: TOOLKIT, path: "claude-toolkit")
+    deploying(TRADER) # the cwd IS a deploying repo — so the refutations below aren't vacuous
 
     body = review_body(trader, ["--sha", foreign])
 
@@ -146,6 +153,7 @@ class CliCommitLinkTest < LinearCli::TestCase
   test "--repo owner/name links a commit that lives in another checkout" do
     trader, = checkout(slug: TRADER, path: "trader-ai")
     _tk, _landed, foreign = checkout(slug: TOOLKIT, path: "claude-toolkit")
+    deploying(TRADER) # the cwd deploys, the resolved repo does not — that is the distinction tested
 
     body = review_body(trader, ["--sha", foreign, "--repo", TOOLKIT])
 
@@ -162,23 +170,39 @@ class CliCommitLinkTest < LinearCli::TestCase
     end
   end
 
-  # --- the paired control: trader-ai is unchanged ------------------------------
+  # --- no deploy claim without a caller who asserted one (AGT-270) --------------
 
-  test "PAIRED CONTROL: from a trader-ai checkout, a landed SHA still links there and still deploys" do
+  test "with $LINEAR_CLI_DEPLOY_REPOS unset, even a landed commit gets NO deploy clause" do
+    # The built-in allowlist is empty. Nothing this tool ships can know which repos deploy or where
+    # to, so an unconfigured install claims nothing — a wrong guess writes an unearned "deploy in
+    # progress" onto a ticket's permanent audit trail.
     root, landed, = checkout(slug: TRADER)
 
     body = review_body(root, ["--sha", landed])
 
-    assert_includes body, "https://github.com/#{TRADER}/commit/#{landed}", "the trader-ai path is unchanged"
-    assert_includes body, "Hatchbox deploy in progress", "trader-ai does deploy — the clause is still right"
+    assert_includes body, "Merged to main", "the merge claim is git's to prove, and it still stands"
+    refute_match(/deploy in progress/, body, "no configured deploy — so no deploy claim")
+  end
+
+  # --- the paired control: a CONFIGURED deploying repo is unchanged ------------
+
+  test "PAIRED CONTROL: in a configured deploying checkout, a landed SHA still links there and still deploys" do
+    root, landed, = checkout(slug: TRADER)
+    deploying(TRADER)
+
+    body = review_body(root, ["--sha", landed])
+
+    assert_includes body, "https://github.com/#{TRADER}/commit/#{landed}", "the linking path is unchanged"
+    assert_includes body, "Hatchbox deploy in progress", "the caller declared this repo deploys"
     assert_includes body, "Merged to main", "and it really is on origin/main, so the claim is earned"
     assert_includes body, "landed on main (#{TRADER})", "the commit subject rides along as before"
   end
 
-  test "in trader-ai, a commit that is NOT on origin/main gets neither the merge claim nor the deploy clause" do
-    # Same repo, same deploy pipeline — but a deploy follows LANDING, not a ticket moving to In
-    # Review. An open PR in trader-ai must not read as shipped either.
+  test "in a deploying repo, a commit that is NOT on origin/main gets neither the merge claim nor the deploy clause" do
+    # Same repo, same declared deploy pipeline — but a deploy follows LANDING, not a ticket moving
+    # to In Review. An open PR must not read as shipped either.
     root, _landed, pushed = checkout(slug: TRADER)
+    deploying(TRADER)
 
     body = review_body(root, ["--sha", pushed])
 
@@ -211,9 +235,10 @@ class CliCommitLinkTest < LinearCli::TestCase
   # --- taking the claim from the caller ----------------------------------------
 
   test "--merged asserts the merge (and the deploy) when git cannot see it, --not-merged withdraws it" do
-    # `bin/branch-landed` in trader-ai already computes LAND_PR: MERGED|NOT-MERGED|UNKNOWN; a caller
-    # that knows more than this checkout does can hand the answer over instead of being overruled.
+    # A caller's own branch-landed check may compute MERGED|NOT-MERGED|UNKNOWN from more than this
+    # checkout can see; it hands the answer over instead of being overruled.
     root, landed, pushed = checkout(slug: TRADER)
+    deploying(TRADER)
 
     assert_includes review_body(root, ["--sha", pushed, "--merged"]), "Merged to main"
     assert_includes review_body(root, ["--sha", pushed, "--merged"]), "Hatchbox deploy in progress"
@@ -224,22 +249,25 @@ class CliCommitLinkTest < LinearCli::TestCase
   test "--no-deploy silences the clause for a deploying repo, --deploy adds it for any repo" do
     trader, landed, = checkout(slug: TRADER, path: "trader-ai")
     toolkit, tk_landed, = checkout(slug: TOOLKIT, path: "claude-toolkit")
+    deploying(TRADER)
 
     refute_includes review_body(trader, ["--sha", landed, "--no-deploy"]), "deploy in progress"
-    assert_includes review_body(toolkit, ["--sha", tk_landed, "--deploy"]), "deploy in progress"
+    assert_includes review_body(toolkit, ["--sha", tk_landed, "--deploy"]), "deploy in progress",
+                    "--deploy is the caller's assertion — it needs no allowlist entry at all"
   end
 
-  test "$LINEAR_CLI_DEPLOY_REPOS replaces the built-in allowlist, and an empty value disables it" do
+  test "$LINEAR_CLI_DEPLOY_REPOS is the only source of the allowlist, and an empty value disables it" do
     trader, landed, = checkout(slug: TRADER, path: "trader-ai")
     toolkit, tk_landed, = checkout(slug: TOOLKIT, path: "claude-toolkit")
 
     ENV["LINEAR_CLI_DEPLOY_REPOS"] = "#{TOOLKIT}=Kamal"
     assert_includes review_body(toolkit, ["--sha", tk_landed]), "Kamal deploy in progress"
-    refute_includes review_body(trader, ["--sha", landed]), "Hatchbox",
-                    "an explicit list REPLACES the default — trader-ai is not in this one"
+    refute_includes review_body(trader, ["--sha", landed]), "deploy in progress",
+                    "the list is exhaustive — a repo absent from it does not deploy"
 
     ENV["LINEAR_CLI_DEPLOY_REPOS"] = ""
-    refute_includes review_body(trader, ["--sha", landed]), "deploy in progress"
+    refute_includes review_body(toolkit, ["--sha", tk_landed]), "deploy in progress",
+                    "an empty value withdraws the list it would otherwise set"
   end
 
   # --- the `commit` verb carries the same rules --------------------------------

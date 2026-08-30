@@ -83,10 +83,10 @@ end
 
 # --- Which repo is this commit in? ---------------------------------------------
 # AGT-212. The commit link used to be built from the invoking checkout's `origin` whether or not the
-# SHA was in that repo — and the documented way to reach `bin/linear` is a shim in the trader-ai app,
-# so a session shipping an ATK/AGT/ORC ticket stands in trader-ai while the commit lives in
-# claude-toolkit, agent-ops-litellm or cerails. Four times over six weeks that minted a
-# github.com/gtyler/trader-ai/commit/<sha> link that 404s, on the ticket's permanent audit trail.
+# SHA was in that repo. That assumption breaks the moment `bin/linear` is reached through a shim in
+# one repo while the work being shipped lives in another: the cwd's origin is not the commit's repo,
+# so the link is minted against a repo the SHA was never in. Measured four times over six weeks —
+# a github.com/<owner>/<name>/commit/<sha> link that 404s, on the ticket's permanent audit trail.
 #
 # A missing link costs a reader one `git show`. A WRONG one sends them hunting through a repo the
 # commit was never in, weeks later, which is exactly when the trail matters. So: prove it or omit it.
@@ -113,7 +113,7 @@ end
 def validated_slug(repo)
   return nil if repo.nil?
 
-  abort "Invalid --repo #{repo.inspect} — expected owner/name (e.g. hirolabsllc/claude-toolkit)." unless
+  abort "Invalid --repo #{repo.inspect} — expected owner/name (e.g. octocat/hello-world)." unless
     repo.to_s =~ %r{\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z}
 
   repo
@@ -200,16 +200,19 @@ def commit_markdown(ref, repo: nil)
 end
 
 # --- Does this repo deploy? ----------------------------------------------------
-# The In Review comment used to end "— Hatchbox deploy in progress" unconditionally. claude-toolkit
-# is a plugin marketplace with no deploy at all; agent-ops-litellm ships via its own deploy.sh. So
-# the clause is emitted only for a repo KNOWN to deploy, and only once the commit is actually on
-# main — a deploy is triggered by landing, not by moving a ticket to In Review.
+# The In Review comment used to end "— <Platform> deploy in progress" unconditionally, which is
+# false for every repo that has no deploy pipeline at all and for every one that ships by some
+# route this tool knows nothing about. So the clause is emitted only for a repo KNOWN to deploy,
+# and only once the commit is actually on main — a deploy is triggered by landing, not by moving a
+# ticket to In Review.
 #
-# Default allowlist below; override with $LINEAR_CLI_DEPLOY_REPOS as a comma-separated list of
-# `owner/name` or `owner/name=Platform` (an empty value means "nothing here deploys"), or per-call
+# AGT-270: the allowlist is empty by default. Nothing this tool ships can know which repos deploy or
+# what they deploy to, and a wrong guess writes an unearned claim onto a permanent audit trail, so
+# the knowledge has to come from the caller: $LINEAR_CLI_DEPLOY_REPOS as a comma-separated list of
+# `owner/name` or `owner/name=Platform` (unset or empty means "nothing here deploys"), or per-call
 # with --deploy / --no-deploy.
 DEPLOY_REPOS_ENV     = "LINEAR_CLI_DEPLOY_REPOS"
-DEFAULT_DEPLOY_REPOS = { "gtyler/trader-ai" => "Hatchbox" }.freeze
+DEFAULT_DEPLOY_REPOS = {}.freeze
 
 def deploy_repos
   raw = ENV[DEPLOY_REPOS_ENV]
@@ -223,7 +226,7 @@ def deploy_repos
   end.to_h
 end
 
-# The deploy platform's name for a repo ("Hatchbox"), nil for a repo that deploys namelessly, and
+# The deploy platform's name for a repo ("Kamal"), nil for a repo that deploys namelessly, and
 # :none for one that does not deploy — three states, so "not in the list" stays distinguishable from
 # "in the list, no platform name".
 def deploy_platform(slug)
