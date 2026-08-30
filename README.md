@@ -36,6 +36,7 @@ Ruby **3.4.9** is pinned via `.ruby-version` (rbenv auto-selects it in the repo 
 |---|---|---|
 | `LINEAR_API_KEY` | yes | Linear personal API key — get one at <https://linear.app/settings/api> |
 | `LINEAR_DEFAULT_TEAM` | no | Default team key for `create` / `list` (e.g. `ENG`). A per-command `--team KEY` always wins. With neither set, `create` / `list` raise a clear error. |
+| `LINEAR_CLI_DEPLOY_REPOS` | no | Which repos `review` may describe as deploying: `owner/name[=Platform]`, comma-separated. Defaults to `gtyler/trader-ai=Hatchbox`; an empty value means nothing deploys. |
 
 If the `dotenv` gem is available, a `.env` in the working directory is auto-loaded (so it "just
 works" inside a project checkout). On servers, export the vars directly.
@@ -46,7 +47,8 @@ works" inside a project checkout). On servers, export the vars directly.
 linear search "<keywords>"                       # dedup search (ALL states) — run BEFORE create
 linear create "Title" --team ENG --label Bug --priority high --desc "body"
 linear start  ENG-12 --session "my session"      # → In Progress
-linear review ENG-12 --sha <sha>                 # → In Review (+ clickable commit link)
+linear review ENG-12 --sha <sha>                 # → In Review (+ commit link, if it can be proven)
+linear review ENG-12 --sha <sha> --repo owner/name   # …when the commit lives in ANOTHER repo
 linear close  ENG-12 --comment "verified"        # → Done
 linear view   ENG-12                             # parent / sub-issues / relations + comment ids
 linear list   --status in_progress --team ENG     # EVERY match, paginated; --limit N caps it
@@ -60,6 +62,23 @@ linear comments       ENG-12                      # WHOLE thread oldest-first, p
 linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md / -
 linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comment
 ```
+
+**`review` and `commit` claim only what git can show.** Both used to build the commit link from the
+cwd's `origin` whether or not the SHA was in that repo, and `review` ended every comment with a
+hardcoded `Merged to main: … — Hatchbox deploy in progress`. Since `bin/linear` reaches most callers
+as a shim inside one app, a session shipping another repo's ticket stood in that app's checkout and
+got all three claims wrong at once — measured five times, on tickets whose work was an open PR in a
+repo with no deploy pipeline (AGT-212). Now:
+
+| Clause | Emitted when |
+|---|---|
+| the commit **link** | the ref resolves to a commit **in this checkout** (so this checkout's `origin` is its repo), or `--repo owner/name` names it. Otherwise the SHA goes out **bare** with a stderr line saying why — a 404 on a permanent audit trail is worse than no link. |
+| **"Merged to main"** | the SHA is an ancestor of origin's default branch. An open PR reads `Pushed for review (not on main yet)`, an unpushed commit `Commit under review (not pushed)`, an unknown SHA `Commit under review`. Override with `--merged` / `--not-merged`. |
+| **"… deploy in progress"** | the resolved repo is in `$LINEAR_CLI_DEPLOY_REPOS` **and** the commit is on main — a deploy follows a merge, not a ticket moving to In Review. Override with `--deploy` / `--no-deploy`. |
+
+Remote-tracking refs can be stale, which only ever makes the merge claim *under*-shoot; that is the
+safe direction for the sentence a reader uses to decide whether work shipped. `commit` follows the
+same repo rule and also takes `--repo`; it asserts nothing about merging or deploying.
 
 **`list` returns every match, not one page.** Linear's `issues` connection caps a query that omits
 `first:` at **50 nodes** silently — no error, no marker — so `list` used to report a 98-issue lane as 50

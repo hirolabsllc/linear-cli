@@ -75,17 +75,48 @@ def git_capture(cmd)
   `#{cmd}`.force_encoding("UTF-8").scrub
 end
 
-# Resolve the repo's GitHub web base (https://github.com/<owner>/<repo>) from the `origin` remote —
-# handles both SSH (git@github.com:owner/repo.git) and HTTPS forms. Returns nil if origin isn't GitHub.
-def github_web_base
-  url = git_capture("git config --get remote.origin.url 2>/dev/null").strip
+# True when `cmd` exits 0. For the git queries whose ANSWER is the exit status rather than the output
+# (`merge-base --is-ancestor`, `rev-parse --verify`); stdout/stderr are discarded.
+def git_ok?(cmd)
+  system("#{cmd} >/dev/null 2>&1") ? true : false
+end
+
+# --- Which repo is this commit in? ---------------------------------------------
+# AGT-212. The commit link used to be built from the invoking checkout's `origin` whether or not the
+# SHA was in that repo — and the documented way to reach `bin/linear` is a shim in the trader-ai app,
+# so a session shipping an ATK/AGT/ORC ticket stands in trader-ai while the commit lives in
+# claude-toolkit, agent-ops-litellm or cerails. Four times over six weeks that minted a
+# github.com/gtyler/trader-ai/commit/<sha> link that 404s, on the ticket's permanent audit trail.
+#
+# A missing link costs a reader one `git show`. A WRONG one sends them hunting through a repo the
+# commit was never in, weeks later, which is exactly when the trail matters. So: prove it or omit it.
+
+# The owner/name slug of the repo the INVOKING working directory is in, from its `origin` remote —
+# SSH, ssh:// and HTTPS forms. nil when there is no origin, or origin isn't GitHub.
+#
+# Resolved from the cwd at call time, never from where this gem or a host's `bin/linear` shim lives:
+# a shim is `load`ed by the app that owns it, so its location says nothing about which repo the
+# ticket's work is in.
+def origin_slug
+  url = git_capture("git remote get-url origin 2>/dev/null").strip
   return nil if url.empty?
 
   case url
-  when %r{\Agit@github\.com:(.+?)(?:\.git)?\z}       then "https://github.com/#{$1}"
-  when %r{\Assh://git@github\.com/(.+?)(?:\.git)?\z} then "https://github.com/#{$1}"
-  when %r{\Ahttps://github\.com/(.+?)(?:\.git)?\z}   then "https://github.com/#{$1}"
+  when %r{\Agit@github\.com:(.+?)(?:\.git)?\z}       then $1
+  when %r{\Assh://git@github\.com/(.+?)(?:\.git)?\z} then $1
+  when %r{\Ahttps://github\.com/(.+?)(?:\.git)?\z}   then $1
   end
+end
+
+# `--repo owner/name` — the escape hatch for the cross-repo case: standing in one checkout, linking a
+# commit that lives in another. Validated, since it is spliced into a URL we publish.
+def validated_slug(repo)
+  return nil if repo.nil?
+
+  abort "Invalid --repo #{repo.inspect} — expected owner/name (e.g. hirolabsllc/claude-toolkit)." unless
+    repo.to_s =~ %r{\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z}
+
+  repo
 end
 
 # Reject anything that isn't a plain git ref so the ref is safe to splice into the `git` shell-outs
@@ -96,21 +127,110 @@ def safe_ref(ref)
   ref
 end
 
-# Markdown for a commit reference: a clickable short-SHA link to GitHub + the commit subject.
-# Resolves the ref locally (default HEAD) for the full SHA + subject; falls back to a bare/linked ref
-# when the object isn't in this checkout or origin != GitHub.
-def commit_markdown(ref)
-  ref  = safe_ref(ref)
-  full = git_capture("git rev-parse --verify --quiet #{ref}^{commit} 2>/dev/null").strip
-  base = github_web_base
+# Origin's default branch as a ref name ("origin/main") — from `origin/HEAD` when the checkout has
+# one, else whichever of origin/main / origin/master exists. nil when the checkout tracks nothing.
+def default_remote_branch
+  head = git_capture("git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null").strip
+  return head unless head.empty?
+
+  %w[origin/main origin/master].find { |ref| git_ok?("git rev-parse --verify --quiet #{ref}") }
+end
+
+# What can be PROVED about a commit from this checkout, locally:
+#   :merged   an ancestor of origin's default branch — it landed
+#   :pushed   some origin/* ref contains it — on the remote, on a branch/PR, but not on main
+#   :local    the object is here, no origin ref contains it — committed, not pushed
+#   :unknown  the object isn't in this checkout at all — this checkout can prove nothing about it
+#
+# Remote-tracking refs can be stale, which only ever makes this UNDER-claim (a merge fetched by
+# nobody reads as :pushed). Under-claiming is the safe direction for a sentence a reader uses to
+# decide whether work shipped.
+def commit_state(full, branch)
+  return :unknown if full.empty?
+  return :merged  if branch && git_ok?("git merge-base --is-ancestor #{full} #{branch}")
+
+  git_capture("git branch --remotes --contains #{full} 2>/dev/null").strip.empty? ? :local : :pushed
+end
+
+# One resolved --sha: the markdown to post, the repo it was linked into (nil when unlinkable), and
+# what this checkout can prove about where it is. Resolved in a single pass so the link and the
+# claims about it can never disagree.
+CommitRef = Struct.new(:ref, :full, :slug, :markdown, :state, :branch)
+
+def resolve_commit(ref, repo: nil)
+  ref    = safe_ref(ref)
+  full   = git_capture("git rev-parse --verify --quiet #{ref}^{commit} 2>/dev/null").strip
+  # An override is the caller's assertion and wins. Otherwise the cwd's origin is only this commit's
+  # repo if the commit is actually IN this checkout — that check is the whole fix.
+  slug   = validated_slug(repo) || (full.empty? ? nil : origin_slug)
+  branch = default_remote_branch
+
+  markdown =
+    if slug.nil?
+      warn_unlinkable(ref, full, origin_slug)
+      full.empty? ? "`#{ref}`" : "`#{full[0, 8]}`"
+    elsif full.empty?
+      "[`#{ref}`](https://github.com/#{slug}/commit/#{ref})"
+    else
+      link    = "[`#{full[0, 8]}`](https://github.com/#{slug}/commit/#{full})"
+      subject = git_capture("git log -1 --format=%s #{full} 2>/dev/null").strip
+      subject.empty? ? link : "#{link} #{subject}"
+    end
+
+  CommitRef.new(ref, full, slug, markdown, commit_state(full, branch), branch)
+end
+
+# Say why a SHA went out bare, on stderr, so the omission reads as a deliberate choice rather than a
+# broken link — and name the flag that fixes it.
+def warn_unlinkable(ref, full, origin)
   if full.empty?
-    base ? "[`#{ref}`](#{base}/commit/#{ref})" : "`#{ref}`"
+    warn "  ! #{ref} is not a commit in this checkout#{origin ? " (#{origin})" : ""} — " \
+         "posting the SHA without a link, since a link built from this repo would 404 (AGT-212)."
+    warn "    fix: run this from the checkout the commit is in, or pass --repo owner/name."
   else
-    short   = full[0, 8]
-    subject = git_capture("git log -1 --format=%s #{full} 2>/dev/null").strip
-    link    = base ? "[`#{short}`](#{base}/commit/#{full})" : "`#{short}`"
-    subject.empty? ? link : "#{link} #{subject}"
+    warn "  ! no GitHub `origin` remote here — posting the SHA without a link. Pass --repo owner/name to link it."
   end
+end
+
+# Markdown for a commit reference: a clickable short-SHA link to GitHub + the commit subject, or a
+# bare `sha` when the repo can't be established. Kept as its own entry point for `commit`, which
+# needs the markdown and none of the merge/deploy reasoning.
+def commit_markdown(ref, repo: nil)
+  resolve_commit(ref, repo: repo).markdown
+end
+
+# --- Does this repo deploy? ----------------------------------------------------
+# The In Review comment used to end "— Hatchbox deploy in progress" unconditionally. claude-toolkit
+# is a plugin marketplace with no deploy at all; agent-ops-litellm ships via its own deploy.sh. So
+# the clause is emitted only for a repo KNOWN to deploy, and only once the commit is actually on
+# main — a deploy is triggered by landing, not by moving a ticket to In Review.
+#
+# Default allowlist below; override with $LINEAR_CLI_DEPLOY_REPOS as a comma-separated list of
+# `owner/name` or `owner/name=Platform` (an empty value means "nothing here deploys"), or per-call
+# with --deploy / --no-deploy.
+DEPLOY_REPOS_ENV     = "LINEAR_CLI_DEPLOY_REPOS"
+DEFAULT_DEPLOY_REPOS = { "gtyler/trader-ai" => "Hatchbox" }.freeze
+
+def deploy_repos
+  raw = ENV[DEPLOY_REPOS_ENV]
+  return DEFAULT_DEPLOY_REPOS if raw.nil?
+
+  raw.split(",").filter_map do |entry|
+    slug, platform = entry.strip.split("=", 2)
+    next if slug.nil? || slug.empty?
+
+    [slug, platform.to_s.strip.empty? ? nil : platform.strip]
+  end.to_h
+end
+
+# The deploy platform's name for a repo ("Hatchbox"), nil for a repo that deploys namelessly, and
+# :none for one that does not deploy — three states, so "not in the list" stays distinguishable from
+# "in the list, no platform name".
+def deploy_platform(slug)
+  repos = deploy_repos
+  return :none unless slug && repos.key?(slug)
+
+  repos[slug]
 end
 
 # --- Screenshots ---------------------------------------------------------------
@@ -654,18 +774,54 @@ def cmd_start(args)
   puts "Comment: #{body}" if body
 end
 
+# The In Review comment for a --sha. Every clause has to be something the tool can actually show is
+# true (AGT-212): `review` moves an issue to In Review, which by definition is NOT "merged to main",
+# and the ticket comment is the permanent record a later reader — or a closeout session — uses to
+# decide whether the work shipped. So the merge claim is taken from git (or from the caller, via
+# --merged/--not-merged), and the deploy clause only follows a commit that actually landed, in a repo
+# that actually deploys.
+#
+# None of the non-merged wordings contain the word "merged": "not merged to main" reads as the claim
+# to a skim or a grep, which is how a one-line status sentence gets read at all.
+def review_comment(ref, repo: nil, merged: nil, deploy: nil)
+  commit = resolve_commit(ref, repo: repo)
+  state  = case merged
+           when true  then :merged
+           when false then commit.state == :merged ? :pushed : commit.state
+           else commit.state
+           end
+
+  branch   = commit.branch.to_s.sub(%r{\Aorigin/}, "")
+  branch   = "main" if branch.empty?
+  platform = deploy_platform(commit.slug)
+  show_deploy = deploy.nil? ? (state == :merged && platform != :none) : deploy
+  clause   = show_deploy ? " — #{platform.is_a?(String) ? "#{platform} " : ""}deploy in progress" : ""
+
+  case state
+  when :merged then "Merged to #{branch}: #{commit.markdown} | #{ts}#{clause}"
+  when :pushed then "Pushed for review (not on #{branch} yet): #{commit.markdown} | #{ts}#{clause}"
+  when :local  then "Commit under review (not pushed): #{commit.markdown} | #{ts}#{clause}"
+  else "Commit under review: #{commit.markdown} | #{ts}#{clause}"
+  end
+end
+
 def cmd_review(args)
-  identifier = args.shift or abort "Usage: #{PROG} review ISSUE-N [--sha <sha>]"
-  sha = nil
+  identifier = args.shift or abort "Usage: #{PROG} review ISSUE-N [--sha <sha>] [--repo owner/name] [--merged|--not-merged] [--deploy|--no-deploy]"
+  sha = repo = merged = deploy = nil
   i = 0
   while i < args.length
     case args[i]
-    when "--sha" then sha = args[i + 1]; i += 2
+    when "--sha"        then sha    = args[i + 1]; i += 2
+    when "--repo"       then repo   = args[i + 1]; i += 2
+    when "--merged"     then merged = true;  i += 1
+    when "--not-merged" then merged = false; i += 1
+    when "--deploy"     then deploy = true;  i += 1
+    when "--no-deploy"  then deploy = false; i += 1
     else i += 1
     end
   end
 
-  body = sha && "Merged to main: #{commit_markdown(sha)} | #{ts} — Hatchbox deploy in progress"
+  body = sha && review_comment(sha, repo: repo, merged: merged, deploy: deploy)
   res  = CLIENT.transition(identifier, :in_review, comment: body)
   puts "#{identifier} → #{res[:issue].dig("state", "name")}"
   puts "Comment: #{body}" if body
@@ -674,20 +830,23 @@ end
 # Attach a commit to an issue as a comment with a clickable GitHub link + subject. Defaults to HEAD —
 # run it after every `git commit` tied to the issue so the ticket carries a linked trail of each
 # commit (not just the final merge SHA). Does NOT change state. --note adds a caption line above.
+# The link is omitted rather than guessed when the ref isn't a commit in this checkout; --repo
+# owner/name links a commit that lives in another repo (AGT-212).
 def cmd_commit(args)
-  identifier = args.shift or abort "Usage: #{PROG} commit ISSUE-N [--sha <ref>] [--note \"context\"]"
+  identifier = args.shift or abort "Usage: #{PROG} commit ISSUE-N [--sha <ref>] [--note \"context\"] [--repo owner/name]"
   ref  = "HEAD"
-  note = nil
+  note = repo = nil
   i = 0
   while i < args.length
     case args[i]
     when "--sha"  then ref  = args[i + 1]; i += 2
     when "--note" then note = args[i + 1]; i += 2
+    when "--repo" then repo = args[i + 1]; i += 2
     else i += 1
     end
   end
 
-  md   = commit_markdown(ref)
+  md   = commit_markdown(ref, repo: repo)
   body = join_md(note, "Commit: #{md} | #{ts}")
   CLIENT.comment(identifier, body)
   puts "#{identifier}: commit linked — #{md}"
@@ -885,8 +1044,14 @@ def run(argv = ARGV)
         relate  ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]   link two issues (real Linear relation)
         unrelate ISSUE-N ISSUE-M                          remove the relation(s) between two issues (inverse of relate)
         start   ISSUE-N [--session "session name"]     move to In Progress + log session attribution
-        review  ISSUE-N [--sha <sha>]                  move to In Review + log merged SHA as a GitHub link
-        commit  ISSUE-N [--sha <ref>] [--note "..."]   link a commit (clickable GitHub link + subject; default HEAD)
+        review  ISSUE-N [--sha <sha>] [--repo owner/name] [--merged|--not-merged] [--deploy|--no-deploy]
+                └─ move to In Review + log the SHA. The comment claims only what git can show: "Merged to
+                   main" ONLY when the SHA is on origin's default branch, and a deploy clause only for a repo
+                   that deploys ($LINEAR_CLI_DEPLOY_REPOS). --merged/--not-merged take the claim from you.
+        commit  ISSUE-N [--sha <ref>] [--note "..."] [--repo owner/name]   link a commit (clickable GitHub
+) +
+   %(                link + subject; default HEAD). The repo comes from THIS checkout's origin remote; a SHA that
+                isn't a commit here is posted WITHOUT a link (a 404 on the trail is worse) — name it with --repo.
         comment ISSUE-N "body" | --body-file PATH|- [--image PATH ...]   add a comment (QA result, notes, etc.)
                 └─ rich multi-line markdown? use  --body-file -  with a SINGLE-quoted heredoc so the shell
                    can't mangle backticks/$/\:   #{PROG} comment ISSUE-N --body-file - <<'MD' … MD
@@ -907,11 +1072,12 @@ def run(argv = ARGV)
         --related ISSUE-N     sibling / same-root-cause follow-up (no hard ordering)
 
       Lifecycle:
-        search (dedup) → create [+link deps] → start (picked up) → commit (after each commit) → review --sha (merged to main) → comment (QA) → close (prod verified)
+        search (dedup) → create [+link deps] → start (picked up) → commit (after each commit) → review --sha (In Review) → comment (QA) → close (prod verified)
         └─ link every commit tied to the issue with `commit ISSUE-N` so the ticket carries a clickable GitHub trail.
         └─ on a match: `reopen` a Done/Canceled one, or `relate`/`cancel --type duplicate` instead of creating a dup.
 
-      Config is env-only: LINEAR_API_KEY (required) + LINEAR_DEFAULT_TEAM (default create/list team).
+      Config is env-only: LINEAR_API_KEY (required) + LINEAR_DEFAULT_TEAM (default create/list team) +
+      LINEAR_CLI_DEPLOY_REPOS (owner/name[=Platform], comma-separated — which repos `review` may call deploying).
       A .env in the working directory is auto-loaded when the `dotenv` gem is available.
 
       Requires LINEAR_API_KEY — get one at linear.app/settings/api

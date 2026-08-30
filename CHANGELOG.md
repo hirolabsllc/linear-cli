@@ -1,5 +1,58 @@
 # Changelog
 
+## [2.11.0] — 2026-08-29
+
+**`review` and `commit` no longer assert a merge, a deploy, or a repo they cannot prove (AGT-212).**
+The In Review comment was one hardcoded sentence:
+
+```
+Merged to main: [`08e63ab`](https://github.com/gtyler/trader-ai/commit/08e63ab) — Hatchbox deploy in progress
+```
+
+Measured on **ATK-1**, whose work is in `hirolabsllc/claude-toolkit`, every clause was false: the
+branch had an **open PR** (not merged), claude-toolkit is a plugin marketplace with **no deploy at
+all**, and `gtyler/trader-ai` **404s** for that SHA. Five recurrences between 2026-07-29 and
+2026-08-29, across AGT, ORC and ATK; three separate sessions hand-corrected the comment afterwards
+with `comment-edit`.
+
+The link was never a literal constant — `origin` was already read from the cwd — which is why looking
+for a "trader-ai" string found nothing. The bug is at the **resolution** step: `bin/linear` reaches
+its callers as a shim inside the trader-ai app, so a session shipping an ATK/AGT/ORC ticket stands in
+trader-ai while the commit lives somewhere else, and the cwd's origin was used regardless.
+
+- **The repo must be provable.** The link is emitted only when the ref **resolves to a commit in the
+  invoking checkout** (so that checkout's `origin` really is its repo), or when the caller names it
+  with **`--repo owner/name`**. Otherwise the SHA is posted **bare**, with a stderr line saying why
+  and naming the flag. A missing link costs a reader one `git show`; a wrong one sends them hunting
+  through a repo the commit was never in, weeks later, which is exactly when the trail matters.
+- **The merge claim comes from git.** `review` says **"Merged to main"** only when the SHA is an
+  ancestor of origin's default branch. An open PR reads **"Pushed for review (not on main yet)"**, an
+  unpushed commit **"Commit under review (not pushed)"**, and a SHA this checkout has never seen just
+  **"Commit under review"**. Stale remote-tracking refs can only make this *under*-claim, which is the
+  safe direction for the sentence a human — or a closeout session — reads to decide whether work
+  shipped. `--merged` / `--not-merged` hand the claim to a caller that knows more (trader-ai's
+  `bin/branch-landed` already computes `LAND_PR: MERGED|NOT-MERGED|UNKNOWN`).
+- **The deploy clause is allowlisted and follows the landing, not the state change.** It is emitted
+  only for a repo known to deploy — `$LINEAR_CLI_DEPLOY_REPOS` (`owner/name[=Platform]`,
+  comma-separated; empty means nothing deploys), defaulting to `gtyler/trader-ai=Hatchbox` — and only
+  once the commit is actually on main, since a deploy is triggered by a merge and not by a ticket
+  moving to In Review. `--deploy` / `--no-deploy` override per call.
+- **`commit` carries the same repo rule** and gained `--repo`. It already claimed nothing beyond "a
+  commit exists", so its wording is unchanged.
+- **The word "merged" does not appear in a body that does not mean it.** "Pushed for review (not on
+  main yet)" rather than "not merged to main", so a skim — or a grep — cannot read the negation as the
+  claim.
+
+**Tests** (`test/cli/commit_link_test.rb`, 12 cases) build **real git repositories** with real
+`refs/remotes` entries rather than stubbing `git`: the whole fix is about reading a working tree
+correctly, so a suite that mocked git away would assert only that the mock was called. The controls
+are paired — the 2026-08-29 case replayed from a claude-toolkit checkout (no `gtyler/trader-ai`, no
+Hatchbox, no merge claim) **and** the trader-ai path proven unchanged (a landed SHA still links there,
+still says "Merged to main", still deploys) — plus standing in trader-ai with a foreign SHA (no link
+at all), an unresolvable remote (bare SHA, command still succeeds), and each override. Verified
+against the live repos too: `08e63ab` from `~/Developer/trader-ai` now emits no link, and from
+`~/Developer/claude-toolkit` links correctly and reads "Pushed for review (not on main yet)".
+
 ## [2.10.0] — 2026-08-05
 
 **`comments` now walks the whole thread instead of returning Linear's newest 250 (AGT-233).**
