@@ -67,7 +67,7 @@ linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comm
 
 **`review` and `commit` claim only what git can show.** Both used to build the commit link from the
 cwd's `origin` whether or not the SHA was in that repo, and `review` ended every comment with a
-hardcoded `Merged to main: … — Hatchbox deploy in progress`. Since `bin/linear` reaches most callers
+hardcoded `Merged to main: … — deploy in progress`. Since `bin/linear` reaches most callers
 as a shim inside one app, a session shipping another repo's ticket stood in that app's checkout and
 got all three claims wrong at once — measured five times, on tickets whose work was an open PR in a
 repo with no deploy pipeline (AGT-212). Now:
@@ -151,34 +151,36 @@ bundle exec rake test     # Minitest, no network (GraphQL transport is stubbed)
 
 CI runs the same on Ruby 3.4.9 (`.github/workflows/ci.yml`).
 
-**Never edit `~/Developer/linear-cli` in place** — work in a `git worktree`. Three to six concurrent
-Claude sessions share that clone, *and* another team executes its working tree live (surface 4 below),
-so an uncommitted edit there is not a work in progress: it is a deploy.
+**Never edit your main clone in place** — work in a `git worktree`. Several concurrent agent sessions
+may share one clone, and a caller can be `exec`ing its working tree live (see *Releasing* below), so an
+uncommitted edit there is not a work in progress: it is a deploy.
 
 ```bash
-git -C ~/Developer/linear-cli fetch origin main
-git -C ~/Developer/linear-cli worktree add -b <topic> /tmp/linear-cli-<topic> origin/main
+git -C <clone> fetch origin main
+git -C <clone> worktree add -b <topic> /tmp/linear-cli-<topic> origin/main
 ```
 
 ## Releasing — a tag does not ship itself
 
-`git tag` publishes nothing. **Four independent checkouts run this gem**, each with its own staleness,
-and a release is not done until all four have moved (AGT-222):
+`git tag` publishes nothing. Each checkout that runs this gem carries its own staleness, and a release
+is not done until every one of them has moved (AGT-222). In practice the gem gets consumed in four
+different shapes, and only two of them have anything that would catch a missed update:
 
-| # | Surface | Runs it | How it updates |
-|---|---|---|---|
-| 1 | trader-ai's bundle | team AKA + the app's admin endpoint | `Gemfile` tag → `bundle update linear_cli` → commit + push → Hatchbox deploy |
-| 2 | the shared trader-ai main checkout | concurrent Claude sessions | `bin/refresh-shared-checkout` |
-| 3 | `/opt/linear-cli` on `ops.hirolabs.com` | Hermes agents, via `/opt/agent-ops/bin/linear` | SSH as `root`, run git as `claude` so ownership survives (AGT-218) |
-| 4 | `~/Developer/linear-cli` — the plain clone | **team ORC**: cerails' `bin/linear` execs this **working tree** | `git merge --ff-only origin/main` |
+| Shape | How it updates | Fails loudly? |
+|---|---|---|
+| **a bundled pin** — the gem pinned by tag in an app's `Gemfile` | bump the tag → `bundle update linear_cli` → commit + push → whatever deploys that app | yes — the lock and the deploy |
+| **a shared clone** — one checkout several people or concurrent agent sessions run from | `git fetch origin main && git merge --ff-only origin/main` | no |
+| **a pinned checkout** — a detached `HEAD` held at a tag on a server | `git fetch --tags --prune origin && git checkout --detach vX.Y.Z` | yes — the pin is explicit |
+| **a raw working-tree `exec`** — a `bin/linear` shim that runs `exe/linear` straight out of a clone | `git fetch --tags origin && git merge --ff-only origin/main` | **no** |
 
-**Surface 4 has no Gemfile, no bundle and no deploy step.** cerails' app Ruby is 3.2.2, below this gem's
-`>= 3.4` floor, so it deliberately does not vendor the gem and instead runs
-`$HOME/Developer/linear-cli/exe/linear` directly under rbenv 3.4.9 (override with `LINEAR_CLI_DIR`).
-The working tree *is* production for another team: **stale means ORC runs old code, dirty means ORC runs
-your half-finished edit** — and neither used to say so. AGT-217 measured exactly that, with the clone one
-commit behind `origin/main` still returning comments newest-first after the fix was tagged and every
-other surface had moved.
+**The last shape is the one that bites, because it has no Gemfile, no bundle and no deploy step.** An
+app whose own Ruby is below this gem's `>= 3.4` floor cannot vendor the gem at all, so instead of
+depending on it, it shims out to a clone and runs `exe/linear` there under its own Ruby (point
+`LINEAR_CLI_DIR` at that clone to move it). That makes the clone's **working tree** production for
+whoever shims into it: **stale means they run old code, dirty means they run your half-finished edit**
+— with no PR, no lockfile and no deploy log anywhere to say so. AGT-217 measured exactly that, with a
+clone one commit behind `origin/main` still returning comments newest-first long after the fix was
+tagged and every other consumer had moved.
 
 ```bash
 bundle exec rake test                                       # green first
@@ -186,18 +188,15 @@ $EDITOR lib/linear_cli/version.rb CHANGELOG.md              # bump + describe
 git commit -am "<summary> (TEAM-N)"
 git tag vX.Y.Z && git push origin main vX.Y.Z
 
-# 4 — do this in the same breath as the push; it is the surface with no deploy gate
-git -C ~/Developer/linear-cli fetch --tags origin
-git -C ~/Developer/linear-cli merge --ff-only origin/main
-
-# 3 — the box fetches over https (public repo, no credential); run the git as `claude`
-ssh root@ops.hirolabs.com \
-  'sudo -u claude git -C /opt/linear-cli fetch --tags --prune origin &&
-   sudo -u claude git -C /opt/linear-cli checkout --detach vX.Y.Z'
-
-# 1 + 2 — in trader-ai: bump the Gemfile tag, bundle update linear_cli, push, then
-bin/refresh-shared-checkout
+# then move every consumer. Do the raw-`exec` clones in the same breath as the push:
+# they are the ones with no deploy gate to catch the omission later.
+git -C <clone> fetch --tags origin
+git -C <clone> merge --ff-only origin/main
 ```
+
+Keep the list of *your* consumers — the actual paths, hosts and owners — with your deployment
+config, not here. What belongs in this README is the shape of the problem, and the fact that the
+CLI now reports its own staleness so a forgotten checkout says so out loud.
 
 ### Staleness announces itself
 
@@ -217,17 +216,17 @@ HEAD is a pinned box, so it is told to move the pin to the new tag.
 The check is **local-only and never touches the network**: one or two `git` invocations (~10–20 ms
 against a 200 ms+ API round-trip), no credentials, nothing that can hang. Consequences of that choice:
 
-- It **cannot see a tag the checkout has never fetched.** For surface 4 that is a non-issue — a release
-  tagged from a worktree shares the clone's ref store, so the tag exists there the instant it is cut —
-  and for surface 3 the update recipe opens with `fetch --tags`. Closing it for a box nobody ever
-  fetches needs a cached `git ls-remote`; see AGT-220.
-- On **surfaces 1 and 2** it never cries wolf and never misdirects. Bundler's vendored checkout carries
-  a permanently modified `linear_cli.gemspec` — bundler rewrites it in place — which is why only `lib/`
+- It **cannot see a tag the checkout has never fetched.** For a clone a release was tagged from, that
+  is a non-issue — a worktree shares the clone's ref store, so the tag exists there the instant it is
+  cut — and a pinned checkout's update recipe opens with `fetch --tags` anyway. Closing it for a box
+  nobody ever fetches needs a cached `git ls-remote`; see AGT-220.
+- **Under bundler** it never cries wolf and never misdirects. Bundler's vendored checkout carries a
+  permanently modified `linear_cli.gemspec` — bundler rewrites it in place — which is why only `lib/`
   and `exe/` count as dirty. And when the `Gemfile` pin genuinely *is* behind, the fix offered is to
   bump the pin and `bundle update`, never a `git checkout` inside a directory bundler re-clones from
   `Gemfile.lock` (which the next `bundle install` would undo, desyncing the lock).
 - Only **linked worktrees** are exempt from the dirty half — uncommitted work is a dev worktree's normal
-  state, whereas in the main clone it is live for every caller.
+  state, whereas in a shared clone it is live for every caller.
 
 Silence it with `LINEAR_CLI_SKIP_CHECKOUT_CHECK=1` (a box held back on purpose, or a caller that parses
 stderr).
