@@ -868,12 +868,11 @@ module Linear
     #
     # **The node shape must match {#search}'s, `state { name type }` included (AGT-230).** These two are
     # siblings: a caller picks one by whether it has a search term, and flattens whichever it got through
-    # ONE serializer. This query selected `state { name }` alone, so trader-ai's admin endpoint —
-    # `Api::V1::Admin::LinearIssuesController#issue_row`, `state_type: i.dig("state", "type")` for both
-    # branches — returned a real `state_type` under `?q=` and `null` under `?status=`/`?label=`, from the
-    # same documented field. A consumer could not tell "no workflow type" from "you used the other
-    # branch". A field either branch reads belongs in both selections; adding one to a single sibling is
-    # how this recurs.
+    # ONE serializer. This query selected `state { name }` alone, so a consumer's admin endpoint — one
+    # row serializer, `state_type: i.dig("state", "type")` for both branches — returned a real
+    # `state_type` under `?q=` and `null` under `?status=`/`?label=`, from the same documented field. Its
+    # own caller could not tell "no workflow type" from "you used the other branch". A field either
+    # branch reads belongs in both selections; adding one to a single sibling is how this recurs.
     def list(status: nil, label: nil, team: nil, limit: nil)
       limit = limit&.to_i
       return [] if limit && limit <= 0

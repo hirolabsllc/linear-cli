@@ -1154,11 +1154,11 @@ class Linear::ClientTest < LinearCli::TestCase
   end
 
   # The bug. `#list` asked for `state { name }` while `#search` asked for `state { name type }`, and
-  # trader-ai's admin endpoint flattens BOTH through one serializer that reads `state.type`. So
-  # `GET /api/v1/admin/linear_issues` answered a real `state_type` under `?q=` and `null` under
-  # `?status=`/`?label=` — same documented field, value decided by which branch ran. The endpoint's own
-  # controller test could not catch it: its fake client's `list` fixture supplied a `state.type` this
-  # query never asked Linear for, so the fixture was more generous than the client.
+  # a consumer's admin endpoint flattens BOTH through one serializer that reads `state.type`. So that
+  # endpoint answered a real `state_type` under `?q=` and `null` under `?status=`/`?label=` — same
+  # documented field, value decided by which branch ran. The endpoint's own controller test could not
+  # catch it: its fake client's `list` fixture supplied a `state.type` this query never asked Linear
+  # for, so the fixture was more generous than the client.
   test "list selects state.type, so a listed row can report its workflow type" do
     with_fake_issues(total: 1) do |fake|
       client.list(team: "ENG")
