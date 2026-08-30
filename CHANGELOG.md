@@ -1,5 +1,61 @@
 # Changelog
 
+## [2.15.0] — 2026-08-30
+
+**BEHAVIOUR CHANGE — a `--flag` in a free-text argument slot is refused instead of becoming the value
+(AGT-276), and every subcommand answers `--help` (AGT-276).**
+
+v2.12.0 (AGT-209) and v2.14.0 (AGT-277) fixed which **flags** and which **bare positionals** these
+parsers reject. Both guards run inside the flag loop — but every parser `shift`s its leading
+positional off ARGV *before* that loop starts, so a `--flag` in that slot never reached either guard.
+It silently became the free-text **value**:
+
+```
+$ linear create --help
+AKA-1338: --help                  # a REAL ticket, titled "--help"
+$ linear retitle ISSUE-N --help
+ISSUE-N: "The real title" → "--help"      # the old title is gone
+```
+
+That is not hypothetical: `create --help` filed AKA-1338 on 2026-07-29, which had to be canceled by
+hand. Both commands **mutate**, and both fire on `--help` — the token you type when you are least sure
+of the syntax, and so least likely to notice.
+
+**`--help` / `-h` is now answered before any parser runs**, per subcommand, printing that command's
+own arguments and exiting 0 without touching anything:
+
+```bash
+linear create --help     # Usage: linear create "Title" [--team KEY] …
+linear close ISSUE-N --comment --help    # usage, not a comment body of "--help"
+```
+
+**A `--`-leading token in a free-text slot now aborts and names itself.** The affected slots were
+`create`'s title, `retitle`'s new title, `label`'s label name, `search`'s term, and the values of
+`edit --title`, `create --label` and `set --label` — everything where a flag token landed silently.
+Where the slot is an **issue id** (`view`, `close`, `comment`, …) a `--flag` already failed loudly at
+`find_issue!`, so those are unchanged.
+
+```
+$ linear create --bogus-flag
+linear create: "--bogus-flag" is a flag, not the title — refusing to use it as the title.
+  ↳ usage:  linear create --help
+  ↳ a title that really starts with dashes: put a bare `--` in front of it.
+```
+
+**The POSIX `--` escape keeps a genuinely dashy value expressible.** It consumes exactly one token and
+flag parsing resumes after it, so the rest of the line is not swallowed as positionals:
+
+```bash
+linear create -- --a-title-starting-with-dashes --label Bug   # title AND label both land
+```
+
+Usage strings for all 24 subcommands now live in one `SUBCOMMAND_USAGE` table, read by the missing-
+argument `abort`, by `--help`, and by the guards' hint, so they cannot drift apart.
+
+20 cases added in `test/cli/leading_positional_test.rb`; 16 fire red against the v2.14.0 parser,
+including the ticket's exact repro. The other 4 pin that normal input is unaffected, so they pass on
+both sides by design.
+
 ## [2.14.0] — 2026-08-30
 
 **BEHAVIOUR CHANGE — the six transition subcommands no longer step over a bare argument (AGT-277).**

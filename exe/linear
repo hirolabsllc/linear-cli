@@ -312,6 +312,107 @@ def read_body_file(path)
   File.read(path).force_encoding("UTF-8").scrub
 end
 
+# --- usage + argument guards ----------------------------------------------------------------------
+
+# The argument shape of every subcommand, keyed by its canonical name. One source of truth for three
+# readers: the `abort` when a required argument is missing, the per-subcommand `--help` output, and
+# the argument guards' "run X --help" hint (AGT-276). The full command list for a bare `linear` is a
+# separate, annotated block at the bottom of this file.
+SUBCOMMAND_USAGE = {
+  "create"         => %(create "Title" [--team KEY] [--label X] [--priority X] [--desc "body"] [--image PATH ...] [--parent ISSUE-N] [--blocked-by ISSUE-N] [--blocks ISSUE-N] [--related ISSUE-N]),
+  "search"         => %(search "<keywords>" [--limit N]),
+  "list"           => %(list [--status todo|in_progress|done] [--label Bug] [--team KEY] [--limit N]),
+  "view"           => %(view ISSUE-N),
+  "url"            => %(url ISSUE-N),
+  "retitle"        => %(retitle ISSUE-N "New title"),
+  "priority"       => %(priority ISSUE-N urgent|high|medium|low|none),
+  "set"            => %(set ISSUE-N [--priority X] [--assignee me|email] [--estimate N] [--due YYYY-MM-DD] [--label NAME]),
+  "edit"           => %(edit ISSUE-N [--title "New title"] [--desc "body" | --desc-file PATH|-]  (--desc-file - reads STDIN; at least one of --title/--desc)),
+  "reopen"         => %(reopen ISSUE-N [--in-progress] ["why it recurred" | --comment "why it recurred" | --comment-file PATH|-]),
+  "parent"         => %(parent CHILD PARENT),
+  "relate"         => %(relate ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]),
+  "unrelate"       => %(unrelate ISSUE-N ISSUE-M),
+  "start"          => %(start ISSUE-N [--session "name"]),
+  "review"         => %(review ISSUE-N [--sha <sha>] [--repo owner/name] [--merged|--not-merged] [--deploy|--no-deploy]),
+  "commit"         => %(commit ISSUE-N [--sha <ref>] [--note "context"] [--repo owner/name]),
+  "comment"        => %(comment ISSUE-N "body" | --body-file PATH|- [--image PATH ...]  (--body-file - reads STDIN)),
+  "comments"       => %(comments ISSUE-N),
+  "comment-edit"   => %(comment-edit ISSUE-N <comment-id> "new body" | --body-file PATH|-),
+  "comment-delete" => %(comment-delete ISSUE-N <comment-id>),
+  "attach"         => %(attach ISSUE-N PATH [PATH ...] [--note "caption"]),
+  "label"          => %(label ISSUE-N <label>),
+  "close"          => %(close ISSUE-N ["reason" | --comment "reason" | --comment-file PATH|-]),
+  "cancel"         => %(cancel ISSUE-N ["reason" | --comment "reason" | --comment-file PATH|-])
+}.freeze
+
+# Subcommand aliases → canonical name, so `rename --help` answers with retitle's usage.
+SUBCOMMAND_ALIASES = { "rename" => "retitle", "prio" => "priority", "edit-desc" => "edit" }.freeze
+
+def canonical_subcommand(cmd)
+  SUBCOMMAND_ALIASES.fetch(cmd.to_s, cmd.to_s)
+end
+
+def usage_for(cmd)
+  "Usage: #{PROG} #{SUBCOMMAND_USAGE.fetch(canonical_subcommand(cmd))}"
+end
+
+# `--help` / `-h` is the most-typed wrong token on a subcommand, and until AGT-276 every subcommand
+# treated it as DATA rather than as a question: `create --help` filed a real ticket titled "--help"
+# (AKA-1338 on 2026-07-29, which had to be canceled by hand) and `retitle ISSUE-N --help` renamed the
+# issue to "--help". It is answered in `run`, BEFORE any parser runs, so the one token you type when
+# you are least sure of the syntax can no longer mutate anything.
+#
+# Only tokens before a POSIX `--` count, so `create -- --help` still files a ticket genuinely titled
+# "--help" rather than printing usage at someone who asked for exactly that.
+def help_requested?(argv)
+  argv.take_while { |a| a != "--" }.any? { |a| ["--help", "-h"].include?(a) }
+end
+
+# Shift the next POSITIONAL argument off `args`, refusing a `--flag` token in that slot.
+#
+# Every parser here shifts its positionals BEFORE its flag loop runs, so a `--flag` in that slot never
+# reaches the `/\A--/` guard AGT-209 added — it silently becomes the VALUE. Where that value is free
+# text the damage is silent AND destructive: a ticket filed with a nonsense title, or a title
+# overwritten by one. (Where it is an issue id, `find_issue!` already fails loudly, so those slots are
+# left as they were.) `what` names the slot in the error. (AGT-276)
+#
+# A leading `--` is the POSIX escape: it consumes itself and the next token is taken literally, so a
+# value that genuinely starts with dashes stays expressible (`create -- --dashy-title`). It escapes
+# exactly ONE token and flag parsing resumes after it — `create -- --dashy-title --label Bug` still
+# gets its label, rather than swallowing the rest of the line as positionals and dropping it.
+def take_positional!(args, cmd, what)
+  if args.first == "--"
+    args.shift
+    escaped = args.shift
+    abort "#{PROG} #{cmd}: `--` must be followed by the #{what}.\n#{usage_for(cmd)}" if escaped.nil?
+
+    return escaped
+  end
+
+  value = args.shift
+  abort usage_for(cmd) if value.nil?
+  return value unless value.start_with?("--")
+
+  abort "#{PROG} #{cmd}: #{value.inspect} is a flag, not the #{what} — refusing to use it as the #{what}.\n" \
+        "  ↳ usage:  #{PROG} #{cmd} --help\n" \
+        "  ↳ a #{what} that really starts with dashes: put a bare `--` in front of it."
+end
+
+# The value of a flag that NAMES something (a title, a label) rather than carrying prose — the same
+# failure as take_positional!, one token to the right: `edit ISSUE-N --title --help` renamed the issue
+# to "--help" because the parser takes args[i + 1] verbatim (AGT-276).
+#
+# Prose flags (--desc / --comment / --note / --session) are deliberately NOT routed through here:
+# markdown legitimately starts with `---`, and the `--help` gate in `run` already answers the only
+# token that actually gets typed into them by mistake.
+def named_value!(args, index, flag, cmd, what)
+  value = args[index + 1]
+  abort "#{PROG} #{cmd}: #{flag} requires a #{what}." if value.nil?
+  return value unless value.start_with?("--")
+
+  abort "#{PROG} #{cmd}: #{flag} #{value.inspect} is a flag, not a #{what}.\n  ↳ usage:  #{PROG} #{cmd} --help"
+end
+
 # Abort with a clear message if any unrecognized --flags were collected, so a fat-finger (e.g. --show)
 # can't be silently treated as input. `cmd` names the subcommand in the error.
 def reject_unknown_flags!(unknown, cmd)
@@ -406,7 +507,7 @@ def format_issue_links(issue)
 end
 
 def cmd_create(args)
-  title = args.shift or abort "Usage: #{PROG} create \"Title\" [--team KEY] [--label X] [--priority X] [--desc \"body\"] [--image PATH ...] [--parent ISSUE-N] [--blocked-by ISSUE-N] [--blocks ISSUE-N] [--related ISSUE-N]"
+  title = take_positional!(args, "create", "title")
   label_name, priority_name, description = nil, "medium", nil
   images = []
   parent_ref = nil
@@ -418,7 +519,7 @@ def cmd_create(args)
   while i < args.length
     case args[i]
     when "--team"                   then team_key      = args[i + 1]; i += 2
-    when "--label"                  then label_name    = args[i + 1]; i += 2
+    when "--label"                  then label_name    = named_value!(args, i, "--label", "create", "label name"); i += 2
     when "--priority"               then priority_name = args[i + 1]; i += 2
     when "--desc", "--description"  then description   = args[i + 1]; i += 2
     when "--desc-file", "--description-file" then description = read_body_file(args[i + 1]); i += 2
@@ -460,7 +561,7 @@ def cmd_create(args)
 end
 
 def cmd_view(args)
-  identifier = args.shift or abort "Usage: #{PROG} view ISSUE-N"
+  identifier = args.shift or abort usage_for("view")
   issue = CLIENT.find_issue(identifier)
   abort "Issue #{identifier} not found" unless issue
 
@@ -500,7 +601,7 @@ end
 
 # List an issue's comments with their ids (the discoverability surface for comment-edit/delete).
 def cmd_comments(args)
-  identifier = args.shift or abort "Usage: #{PROG} comments ISSUE-N"
+  identifier = args.shift or abort usage_for("comments")
   list = CLIENT.comments(identifier)
   if list.empty?
     puts "No comments on #{identifier}."
@@ -513,8 +614,8 @@ end
 # Edit an existing comment's body by comment id. New body comes from the positional arg or --body-file
 # (the file form avoids shell-escaping multi-line markdown). The comment must belong to ISSUE-N.
 def cmd_comment_edit(args)
-  identifier = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH|-"
-  comment_id = args.shift or abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH|-"
+  identifier = args.shift or abort usage_for("comment-edit")
+  comment_id = args.shift or abort usage_for("comment-edit")
   body_file = nil
   positionals = []
   unknown = []
@@ -535,7 +636,7 @@ def cmd_comment_edit(args)
     abort "Pass either a body argument or --body-file, not both." if body
     body = read_body_file(body_file)
   end
-  abort "Usage: #{PROG} comment-edit ISSUE-N <comment-id> \"new body\" | --body-file PATH|-" if body.nil? || body.strip.empty?
+  abort usage_for("comment-edit") if body.nil? || body.strip.empty?
 
   ensure_comment_on_issue!(identifier, comment_id)
   CLIENT.update_comment(comment_id, body)
@@ -544,8 +645,8 @@ end
 
 # Delete a comment by comment id. The comment must belong to ISSUE-N (guards a wrong-issue / typo'd id).
 def cmd_comment_delete(args)
-  identifier = args.shift or abort "Usage: #{PROG} comment-delete ISSUE-N <comment-id>"
-  comment_id = args.shift or abort "Usage: #{PROG} comment-delete ISSUE-N <comment-id>"
+  identifier = args.shift or abort usage_for("comment-delete")
+  comment_id = args.shift or abort usage_for("comment-delete")
   unknown = []
   i = 0
   while i < args.length
@@ -570,14 +671,14 @@ def ensure_comment_on_issue!(identifier, comment_id)
 end
 
 def cmd_url(args)
-  identifier = args.shift or abort "Usage: #{PROG} url ISSUE-N"
+  identifier = args.shift or abort usage_for("url")
   issue = CLIENT.find_issue(identifier) or abort "Issue #{identifier} not found"
   puts issue["url"]
 end
 
 def cmd_retitle(args)
-  identifier = args.shift or abort "Usage: #{PROG} retitle ISSUE-N \"New title\""
-  new_title  = args.shift or abort "Usage: #{PROG} retitle ISSUE-N \"New title\""
+  identifier = take_positional!(args, "retitle", "issue id")
+  new_title  = take_positional!(args, "retitle", "new title")
   res = CLIENT.retitle(identifier, new_title)
   updated = res[:issue]
   puts "#{updated["identifier"]}: \"#{res[:old_title]}\" → \"#{updated["title"]}\""
@@ -588,8 +689,8 @@ end
 # `retitle`. The general `set` command can do this too; `priority` is the one-word shortcut for the
 # field that gets bumped most.
 def cmd_priority(args)
-  identifier = args.shift or abort "Usage: #{PROG} priority ISSUE-N urgent|high|medium|low|none"
-  word       = args.shift or abort "Usage: #{PROG} priority ISSUE-N urgent|high|medium|low|none"
+  identifier = args.shift or abort usage_for("priority")
+  word       = args.shift or abort usage_for("priority")
   unknown = args.select { |a| a =~ /\A--/ }
   reject_unknown_flags!(unknown, "priority")
 
@@ -601,7 +702,7 @@ end
 # General field setter — change priority/assignee/estimate/due/label in one call so each field no
 # longer needs a one-off raw GraphQL mutation. Any subset of flags; prints each old → new change.
 def cmd_set(args)
-  identifier = args.shift or abort "Usage: #{PROG} set ISSUE-N [--priority X] [--assignee me|email] [--estimate N] [--due YYYY-MM-DD] [--label NAME]"
+  identifier = args.shift or abort usage_for("set")
   priority = assignee = estimate = due = nil
   labels  = []
   unknown = []
@@ -612,7 +713,7 @@ def cmd_set(args)
     when "--assignee" then assignee = args[i + 1]; i += 2
     when "--estimate" then estimate = args[i + 1]; i += 2
     when "--due"      then due      = args[i + 1]; i += 2
-    when "--label"    then labels  << args[i + 1]; i += 2
+    when "--label"    then labels  << named_value!(args, i, "--label", "set", "label name"); i += 2
     when /\A--/       then unknown << args[i]; i += 1
     else i += 1
     end
@@ -643,8 +744,7 @@ end
 # description had already been replaced would leave a half-applied edit, and the client's guard alone
 # can only refuse the call it is given.
 def cmd_edit(args)
-  usage = "Usage: #{PROG} edit ISSUE-N [--title \"New title\"] [--desc \"body\" | --desc-file PATH|-]  " \
-          "(--desc-file - reads STDIN; at least one of --title/--desc)"
+  usage = usage_for("edit")
   identifier = args.shift or abort usage
   title = nil
   description = nil
@@ -652,7 +752,7 @@ def cmd_edit(args)
   i = 0
   while i < args.length
     case args[i]
-    when "--title"                           then title       = args[i + 1]; i += 2
+    when "--title"                           then title       = named_value!(args, i, "--title", "edit", "title"); i += 2
     when "--desc", "--description"           then description = args[i + 1]; i += 2
     when "--desc-file", "--description-file" then description = read_body_file(args[i + 1]); i += 2
     when /\A--/                              then unknown << args[i]; i += 1
@@ -709,7 +809,7 @@ def warn_dropped_images(identifier, dropped)
 end
 
 def cmd_close(args)
-  usage = "Usage: #{PROG} close ISSUE-N [\"reason\" | --comment \"reason\" | --comment-file PATH|-]"
+  usage = usage_for("close")
   identifier = args.shift or abort usage
   comment = comment_file = nil
   positionals = []
@@ -782,7 +882,7 @@ def cmd_list(args)
 end
 
 def cmd_comment(args)
-  identifier = args.shift or abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH|- [--image PATH ...]  (--body-file - reads STDIN)"
+  identifier = args.shift or abort usage_for("comment")
   images = []
   body_file = nil
   positionals = []
@@ -809,7 +909,7 @@ def cmd_comment(args)
     abort "Pass either a body argument or --body-file, not both." if body
     body = read_body_file(body_file)
   end
-  abort "Usage: #{PROG} comment ISSUE-N \"body\" | --body-file PATH|- [--image PATH ...]  (--body-file - reads STDIN)" if body.nil? || body.strip.empty?
+  abort usage_for("comment") if body.nil? || body.strip.empty?
 
   body = join_md(body, images_markdown(images)) if images.any?
   CLIENT.comment(identifier, body)
@@ -819,7 +919,7 @@ end
 # Attach screenshots (repro / QA evidence) to an issue as a comment with inline images.
 # Positional args after ISSUE-N are image paths; --note adds a caption above them.
 def cmd_attach(args)
-  identifier = args.shift or abort "Usage: #{PROG} attach ISSUE-N PATH [PATH ...] [--note \"caption\"]"
+  identifier = args.shift or abort usage_for("attach")
   note  = nil
   paths = []
   i = 0
@@ -829,14 +929,14 @@ def cmd_attach(args)
     else paths << args[i]; i += 1
     end
   end
-  abort "Usage: #{PROG} attach ISSUE-N PATH [PATH ...] [--note \"caption\"]" if paths.empty?
+  abort usage_for("attach") if paths.empty?
   body = join_md(note, images_markdown(paths))
   CLIENT.comment(identifier, body)
   puts "Attached #{paths.length} image(s) to #{identifier}."
 end
 
 def cmd_start(args)
-  usage = "Usage: #{PROG} start ISSUE-N [--session \"name\"]"
+  usage = usage_for("start")
   identifier = args.shift or abort usage
   session_name = nil
   positionals = []
@@ -891,7 +991,7 @@ def review_comment(ref, repo: nil, merged: nil, deploy: nil)
 end
 
 def cmd_review(args)
-  usage = "Usage: #{PROG} review ISSUE-N [--sha <sha>] [--repo owner/name] [--merged|--not-merged] [--deploy|--no-deploy]"
+  usage = usage_for("review")
   identifier = args.shift or abort usage
   sha = repo = merged = deploy = nil
   positionals = []
@@ -926,7 +1026,7 @@ end
 # The link is omitted rather than guessed when the ref isn't a commit in this checkout; --repo
 # owner/name links a commit that lives in another repo (AGT-212).
 def cmd_commit(args)
-  identifier = args.shift or abort "Usage: #{PROG} commit ISSUE-N [--sha <ref>] [--note \"context\"] [--repo owner/name]"
+  identifier = args.shift or abort usage_for("commit")
   ref  = "HEAD"
   note = repo = nil
   i = 0
@@ -946,14 +1046,14 @@ def cmd_commit(args)
 end
 
 def cmd_label(args)
-  identifier = args.shift or abort "Usage: #{PROG} label ISSUE-N <label>"
-  label_name = args.shift or abort "Usage: #{PROG} label ISSUE-N <label>"
+  identifier = take_positional!(args, "label", "issue id")
+  label_name = take_positional!(args, "label", "label name")
   CLIENT.add_labels(identifier, [label_name])
   puts "#{identifier}: label '#{label_name}' applied."
 end
 
 def cmd_cancel(args)
-  usage = "Usage: #{PROG} cancel ISSUE-N [\"reason\" | --comment \"reason\" | --comment-file PATH|-]"
+  usage = usage_for("cancel")
   identifier = args.shift or abort usage
   comment = comment_file = nil
   positionals = []
@@ -981,7 +1081,7 @@ end
 # Full-text dedup search — relevance-ranked across title + description, ALL states (Done/Canceled
 # included) so reopen/link candidates surface. Run this BEFORE `create` to avoid filing a duplicate.
 def cmd_search(args)
-  term  = args.shift or abort "Usage: #{PROG} search \"<keywords>\" [--limit N]"
+  term  = take_positional!(args, "search", "search term")
   limit = 10
   i = 0
   while i < args.length
@@ -1018,8 +1118,7 @@ end
 # work. Keeps the original repro, history, and merged-SHA trail. Defaults to Todo; --in-progress
 # reopens straight to active.
 def cmd_reopen(args)
-  usage = "Usage: #{PROG} reopen ISSUE-N [--in-progress] " \
-          "[\"why it recurred\" | --comment \"why it recurred\" | --comment-file PATH|-]"
+  usage = usage_for("reopen")
   identifier = args.shift or abort usage
   to_progress = false
   comment = comment_file = nil
@@ -1049,7 +1148,7 @@ end
 # ISSUE-X" comment). --type related (default), blocks, blocked-by, duplicate, or similar. For an
 # epic→sub-ticket breakdown use the `parent` command instead.
 def cmd_relate(args)
-  usage = "Usage: #{PROG} relate ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]"
+  usage = usage_for("relate")
   a = args.shift or abort usage
   b = args.shift or abort usage
   type = "related"
@@ -1086,8 +1185,8 @@ end
 # epic broken into numbered sub-tickets (e.g. "Radar 1/6..6/6"). Unlike `relate`, this shows as a
 # real parent/sub-issue with progress rollup.
 def cmd_parent(args)
-  child  = args.shift or abort "Usage: #{PROG} parent CHILD PARENT"
-  parent = args.shift or abort "Usage: #{PROG} parent CHILD PARENT"
+  child  = args.shift or abort usage_for("parent")
+  parent = args.shift or abort usage_for("parent")
   CLIENT.set_parent_by_identifier(child, parent)
   puts "#{child} is now a sub-issue of #{parent}."
 end
@@ -1095,8 +1194,8 @@ end
 # Remove any relation(s) between two issues (the inverse of `relate`) — e.g. to clean up a link
 # created in error. Deletes in both directions if present.
 def cmd_unrelate(args)
-  a = args.shift or abort "Usage: #{PROG} unrelate ISSUE-N ISSUE-M"
-  b = args.shift or abort "Usage: #{PROG} unrelate ISSUE-N ISSUE-M"
+  a = args.shift or abort usage_for("unrelate")
+  b = args.shift or abort usage_for("unrelate")
   count = CLIENT.unrelate(a, b)
   abort "No relation between #{a} and #{b}." if count.zero?
 
@@ -1109,6 +1208,16 @@ end
 # shim `load`s this file in production, where the env flag is unset, so `run(argv)` fires normally.
 def run(argv = ARGV)
   command = argv.shift
+
+  # Answer `--help` / `-h` on a known subcommand HERE — before its parser can shift the token in as a
+  # title, a label or a comment body — with that subcommand's own usage, and exit 0. See
+  # help_requested? for why this token in particular earns a gate of its own (AGT-276).
+  if SUBCOMMAND_USAGE.key?(canonical_subcommand(command)) && help_requested?(argv)
+    puts usage_for(command)
+    puts "Run `#{PROG}` with no arguments for the full command list."
+    exit 0
+  end
+
   case command
   when "create"  then cmd_create(argv)
   when "view"    then cmd_view(argv)
@@ -1186,6 +1295,10 @@ def run(argv = ARGV)
                 └─ a one-liner can go in as a plain quoted argument, exactly like `comment ISSUE-N "body"` —
                    QUOTE it as one argument, and don't combine it with --comment/--comment-file (AGT-277).
         cancel  ISSUE-N ["reason" | --comment "reason" | --comment-file PATH|-]   mark Canceled (duplicates / won't-do)
+
+      Every subcommand takes --help / -h — `#{PROG} create --help` prints just that command's
+      arguments and does nothing else. A leading `--` escapes the next token, so a title or label that
+      genuinely starts with dashes is still expressible: `#{PROG} create -- --dashy-title --label Bug`.
 
       Labels auto-create on first use, so --label Bug works even before the label exists.
 
