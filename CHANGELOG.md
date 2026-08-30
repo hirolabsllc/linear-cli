@@ -1,5 +1,44 @@
 # Changelog
 
+## [2.16.0] — 2026-08-30
+
+**The flag loops that had no guard at all (AGT-275).** [AGT-209](https://linear.app/hgl-ai/issue/AGT-209)
+(v2.12.0) fixed which *flags* the parsers reject, [AGT-277](https://linear.app/hgl-ai/issue/AGT-277)
+(v2.14.0) which bare *positionals*, and [AGT-276](https://linear.app/hgl-ai/issue/AGT-276) (v2.15.0)
+the *leading* positional plus the `--help` gate. This is the residue none of the three reached —
+every case below exited **0** on v2.15.0:
+
+| command | was | now |
+|---|---|---|
+| `commit ISSUE-N --sah abc` | stepped over the typo, fell back to `HEAD`, and posted **the wrong commit** to the ticket as fact | aborts, names the flag |
+| `list --stat done` | dropped the filter and returned **every** issue | aborts |
+| `attach ISSUE-N --nope a.png` | the flag became an image path — caught only because no such file existed | aborts, names the flag |
+| `search "x" --limit abc` | `.to_i` → limit 0 → *"No candidates … safe to create a new one."* | aborts (`--limit` takes a positive integer) |
+| `create "A title" --desc` | dangling flag bound `nil`; the ticket was filed **with no body** | aborts |
+| `create Fix the parser` | filed a ticket titled `Fix` and discarded the rest | aborts, pointing at `--desc` |
+| `linear crate "A title"` | printed usage and **exited 0** — indistinguishable from success to a script | exits 1 |
+| `linear help create` | printed the whole command list | prints `create`'s usage |
+
+`commit`, `list` and `attach` had no `/\A--/` branch whatsoever. `commit`'s is the worst of the
+three: it does not merely fail, it writes a link to the wrong commit onto the ticket's permanent
+trail — the one place a later reader or a closeout session looks to decide what actually shipped.
+
+Value-taking flags on `create`, `list`, `commit` and `attach` now go through the same
+`named_value!` / `flag_value!` pair AGT-276 introduced. The split is deliberate and unchanged:
+flags that **name** something (`--team`, `--label`, `--sha`, `--repo`, `--limit`, `--image`,
+`--parent`, `--blocks`, …) reject a `--`-leading value as well as a missing one; flags carrying
+**prose** (`--desc`, `--note`, `--comment`, `--session`) only reject a missing one, because markdown
+legitimately starts with `---`. The `--limit` integer check `list` gained in AGT-224 is now shared
+with `search`.
+
+**Nothing about the `--` escape changes.** `create -- --dashy-title --label Bug` still escapes
+exactly one token and resumes flag parsing after it — pinned by a paired control, since the new
+extra-positional check is exactly what could have broken it.
+
+Covered by `test/cli/unguarded_flag_loops_test.rb` (25 tests), which can be pointed at any script via
+`LINEAR_CLI_EXE`: against v2.15.0 it reports 11 failures, against this one 0. The other 14 are paired
+controls and pass on both sides by design.
+
 ## [2.15.0] — 2026-08-30
 
 **BEHAVIOUR CHANGE — a `--flag` in a free-text argument slot is refused instead of becoming the value

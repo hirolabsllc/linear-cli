@@ -413,6 +413,21 @@ def named_value!(args, index, flag, cmd, what)
   abort "#{PROG} #{cmd}: #{flag} #{value.inspect} is a flag, not a #{what}.\n  ↳ usage:  #{PROG} #{cmd} --help"
 end
 
+# A count flag whose value is not a positive integer must ABORT, not coerce to 0. `search "x" --limit
+# abc` quietly became limit 0 and printed "No candidates … safe to create a new one" — a dedup search
+# that invites the duplicate it exists to prevent. `list` was fixed for this in AGT-224; `search` had
+# the identical hole, so the check lives here once and both call it (AGT-275).
+def positive_int!(value, cmd, flag)
+  n = begin
+    Integer(value.to_s.strip, 10)
+  rescue ArgumentError, TypeError
+    abort "#{PROG} #{cmd}: #{flag} takes a positive integer, got #{value.inspect}"
+  end
+  abort "#{PROG} #{cmd}: #{flag} must be positive, got #{n}" unless n.positive?
+
+  n
+end
+
 # Abort with a clear message if any unrecognized --flags were collected, so a fat-finger (e.g. --show)
 # can't be silently treated as input. `cmd` names the subcommand in the error.
 def reject_unknown_flags!(unknown, cmd)
@@ -513,26 +528,37 @@ def cmd_create(args)
   parent_ref = nil
   blocks_refs, blocked_by_refs, related_refs = [], [], []
   team_key = default_team   # --team KEY > $LINEAR_DEFAULT_TEAM (no hardcoded fallback)
+  positionals = []
   unknown = []
 
   i = 0
   while i < args.length
     case args[i]
-    when "--team"                   then team_key      = args[i + 1]; i += 2
+    when "--team"                   then team_key      = named_value!(args, i, "--team", "create", "team key"); i += 2
     when "--label"                  then label_name    = named_value!(args, i, "--label", "create", "label name"); i += 2
-    when "--priority"               then priority_name = args[i + 1]; i += 2
-    when "--desc", "--description"  then description   = args[i + 1]; i += 2
-    when "--desc-file", "--description-file" then description = read_body_file(args[i + 1]); i += 2
-    when "--image"                  then images       << args[i + 1]; i += 2
-    when "--parent"                 then parent_ref     = args[i + 1]; i += 2
-    when "--blocks"                 then blocks_refs   << args[i + 1]; i += 2
-    when "--blocked-by", "--depends-on", "--after" then blocked_by_refs << args[i + 1]; i += 2
-    when "--related", "--relates-to"               then related_refs    << args[i + 1]; i += 2
+    when "--priority"               then priority_name = named_value!(args, i, "--priority", "create", "priority word"); i += 2
+    # --desc/--desc-file carry PROSE, so they take flag_value! rather than named_value!: markdown
+    # legitimately starts with `---`, and only the MISSING-value half applies (AGT-276's split).
+    when "--desc", "--description"  then description   = flag_value!(args, i, args[i], "create"); i += 2
+    when "--desc-file", "--description-file" then description = read_body_file(flag_value!(args, i, args[i], "create")); i += 2
+    when "--image"                  then images       << named_value!(args, i, "--image", "create", "path"); i += 2
+    when "--parent"                 then parent_ref     = named_value!(args, i, "--parent", "create", "issue id"); i += 2
+    when "--blocks"                 then blocks_refs   << named_value!(args, i, "--blocks", "create", "issue id"); i += 2
+    when "--blocked-by", "--depends-on", "--after" then blocked_by_refs << named_value!(args, i, args[i], "create", "issue id"); i += 2
+    when "--related", "--relates-to"               then related_refs    << named_value!(args, i, args[i], "create", "issue id"); i += 2
     when /\A--/                     then unknown      << args[i]; i += 1
-    else i += 1
+    else positionals << args[i]; i += 1
     end
   end
   reject_unknown_flags!(unknown, "create")
+  # A stray positional was stepped over in silence, so an UNQUOTED multi-word title filed a ticket
+  # named after its first word — `create Fix the parser` filed "Fix" and dropped the rest. `create`
+  # has no body positional to absorb it the way AGT-277 gave `comment`/`close` one, so it is an
+  # error: the same "never a silent drop" rule, reached by the only door left open (AGT-275).
+  unless positionals.empty?
+    abort "#{PROG} create: unexpected extra argument(s) #{positionals.map(&:inspect).join(" ")} — " \
+          "quote the whole title, and pass a body with --desc/--desc-file."
+  end
 
   # Always attach screenshots when given — uploaded and embedded under a Screenshots heading. (Image
   # upload is a local-file concern, so the CLI builds the final description, then hands it to the client.)
@@ -841,27 +867,25 @@ def cmd_list(args)
   label_filter  = nil
   team_key      = default_team
   limit         = nil
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--status" then status_filter = args[i + 1]; i += 2
-    when "--label"  then label_filter  = args[i + 1]; i += 2
-    when "--team"   then team_key      = args[i + 1]; i += 2
-    when "--limit"  then limit         = args[i + 1]; i += 2
+    when "--status" then status_filter = named_value!(args, i, "--status", "list", "status"); i += 2
+    when "--label"  then label_filter  = named_value!(args, i, "--label", "list", "label name"); i += 2
+    when "--team"   then team_key      = named_value!(args, i, "--team", "list", "team key"); i += 2
+    when "--limit"  then limit         = named_value!(args, i, "--limit", "list", "count"); i += 2
+    when /\A--/     then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  # `list` had no unknown-flag branch at all, so `list --stat done` stepped over the typo and returned
+  # EVERY issue — a wrong answer wearing a right answer's clothes (AGT-275).
+  reject_unknown_flags!(unknown, "list")
 
   # A typo'd --limit must not coerce to 0 and print "No issues found." — that is the same silent
   # wrong answer, in miniature, that AGT-224 was filed for.
-  if limit
-    limit = begin
-      Integer(limit.to_s.strip, 10)
-    rescue ArgumentError, TypeError
-      abort "#{PROG} list: --limit takes a positive integer, got #{limit.inspect}"
-    end
-    abort "#{PROG} list: --limit must be positive, got #{limit}" unless limit.positive?
-  end
+  limit = positive_int!(limit, "list", "--limit") if limit
 
   # No --limit means EVERY matching issue, however many pages that takes (AGT-224). --limit is the
   # opt-in for a caller that only wants the oldest N and would rather not page a whole team for them
@@ -922,13 +946,18 @@ def cmd_attach(args)
   identifier = args.shift or abort usage_for("attach")
   note  = nil
   paths = []
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--note" then note = args[i + 1]; i += 2
+    when "--note" then note = flag_value!(args, i, "--note", "attach"); i += 2
+    when /\A--/   then unknown << args[i]; i += 1
     else paths << args[i]; i += 1
     end
   end
+  # A typo used to land in the PATH list and was caught only because no such file existed — the
+  # filesystem covering for the parser, which stops the moment a path-shaped typo does exist.
+  reject_unknown_flags!(unknown, "attach")
   abort usage_for("attach") if paths.empty?
   body = join_md(note, images_markdown(paths))
   CLIENT.comment(identifier, body)
@@ -1029,15 +1058,21 @@ def cmd_commit(args)
   identifier = args.shift or abort usage_for("commit")
   ref  = "HEAD"
   note = repo = nil
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--sha"  then ref  = args[i + 1]; i += 2
-    when "--note" then note = args[i + 1]; i += 2
-    when "--repo" then repo = args[i + 1]; i += 2
+    when "--sha"  then ref  = named_value!(args, i, "--sha", "commit", "ref"); i += 2
+    when "--note" then note = flag_value!(args, i, "--note", "commit"); i += 2
+    when "--repo" then repo = named_value!(args, i, "--repo", "commit", "owner/name"); i += 2
+    when /\A--/   then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  # `commit` had no guard either, and its failure LIES on the permanent trail: `commit ISSUE-N --sah
+  # abc` stepped over the typo, fell back to HEAD, and posted the wrong commit to the ticket as fact
+  # — the one place a later reader looks to decide what shipped (AGT-275).
+  reject_unknown_flags!(unknown, "commit")
 
   md   = commit_markdown(ref, repo: repo)
   body = join_md(note, "Commit: #{md} | #{ts}")
@@ -1083,13 +1118,18 @@ end
 def cmd_search(args)
   term  = take_positional!(args, "search", "search term")
   limit = 10
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--limit" then limit = (args[i + 1] || "10").to_i; i += 2
+    # `.to_i` made `--limit abc` mean 10 → 0 and printed "safe to create a new one", which is how a
+    # duplicate gets filed by the very command that exists to prevent one (AGT-275).
+    when "--limit" then limit = positive_int!(named_value!(args, i, "--limit", "search", "count"), "search", "--limit"); i += 2
+    when /\A--/    then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "search")
 
   issues = CLIENT.search(term, limit: limit)
   if issues.empty?
@@ -1218,6 +1258,18 @@ def run(argv = ARGV)
     exit 0
   end
 
+  # `#{PROG} help <subcommand>` — the same text by the other spelling. Without this it fell through
+  # to the full command list, which answers a different question than the one that was asked.
+  if command == "help" && !argv.empty?
+    sub = argv.first
+    unless SUBCOMMAND_USAGE.key?(canonical_subcommand(sub))
+      abort "#{PROG}: unknown command #{sub.inspect} — run `#{PROG}` with no args for the command list."
+    end
+
+    puts usage_for(sub)
+    exit 0
+  end
+
   case command
   when "create"  then cmd_create(argv)
   when "view"    then cmd_view(argv)
@@ -1319,6 +1371,15 @@ def run(argv = ARGV)
 
       Requires LINEAR_API_KEY — get one at linear.app/settings/api
     USAGE
+    # A MISTYPED command must not exit 0 having done nothing: to a script — a board tick, a CI step,
+    # a `set -e` shell function — that is indistinguishable from success, so `linear crate "Title"`
+    # reported that it had filed a ticket it never filed. A bare `#{PROG}`, `help` and `--help` are a
+    # real request for this text and still exit 0 (AGT-275).
+    unless command.nil? || %w[help --help -h].include?(command)
+      $stdout.flush   # stdout is block-buffered when piped; stderr is not
+      warn "#{PROG}: unknown command #{command.inspect}"
+      exit 1
+    end
   end
 rescue Linear::Client::UsageLimited => e
   # Terminal plan/usage limit (e.g. the free-plan active-issue cap). Surface Linear's own upgrade copy.
