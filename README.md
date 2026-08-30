@@ -64,6 +64,27 @@ linear comment        ENG-12 "QA passed"         # or: --body-file notes.md / --
 linear comments       ENG-12                      # WHOLE thread oldest-first, paginated; comment ids
 linear comment-edit   ENG-12 <comment-id> "fix"   # or: --body-file notes.md / -
 linear comment-delete ENG-12 <comment-id>         # remove a stray/mistaken comment
+
+linear create --help                             # any subcommand answers with ITS usage, exit 0
+linear help create                               # …the same text, the other spelling
+```
+
+**A flag the parser does not understand is always an error, never input.** Three rounds closed this
+class from different sides — AGT-209 (which *flags* are rejected), AGT-277 (which bare *positionals*
+are), AGT-276 (the *leading* positional, plus the `--help` gate) — and v2.16.0 closed the residue:
+`commit`, `list` and `attach` had no unknown-flag branch at all, so `commit ENG-12 --sah abc` fell
+back to `HEAD` and posted **the wrong commit** to the ticket as fact, and `list --stat done` quietly
+dropped the filter and returned everything. `search --limit` took `.to_i`, so `--limit abc` meant 0
+and the dedup search reported the workspace clean — inviting the duplicate it exists to prevent.
+A value-taking flag left dangling (`create "T" --desc`) aborts instead of binding `nil`, an unquoted
+multi-word title aborts instead of filing its first word, and a mistyped *command* exits 1 rather
+than printing usage and exiting 0.
+
+Use `--` when a positional genuinely starts with dashes; it escapes exactly one token, and flags
+after it still parse:
+
+```bash
+linear create -- "--dashy-title" --label Bug
 ```
 
 **`review` and `commit` claim only what git can show.** Both used to build the commit link from the
