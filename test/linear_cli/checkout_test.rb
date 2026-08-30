@@ -15,8 +15,8 @@ require "stringio"
 #
 # The load-bearing case is the NEGATIVE one: bundler's vendored copy of this gem is a git checkout
 # with a permanently modified gemspec and no tags, and it must stay silent. A warning that cries wolf
-# on every `bin/linear` in trader-ai is worse than no warning at all — it trains the eye past the one
-# line that matters.
+# on every `bin/linear` run by a bundled consumer is worse than no warning at all — it trains the eye
+# past the one line that matters.
 class LinearCliCheckoutTest < LinearCli::TestCase
   def setup
     @dir = Dir.mktmpdir("linear-cli-checkout-test")

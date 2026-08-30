@@ -7,10 +7,11 @@ module LinearCli
   # or dirty (AGT-222).
   #
   # Tagging the gem does not ship it. `linear` reaches its callers as FOUR independent checkouts, each
-  # with its own staleness: trader-ai's bundled copy (Gemfile tag → deploy), the shared main checkout,
-  # the agent-ops box at `/opt/linear-cli`, and the plain clone at `~/Developer/linear-cli` that
-  # cerails' `bin/linear` `exec`s DIRECTLY — working tree and all, with no Gemfile, no bundle and no
-  # deploy gate between an edit and another team's ticketing. Two failure modes, both silent until now:
+  # with its own staleness: a BUNDLED copy vendored by a consumer's Gemfile (tag → deploy), the shared
+  # main checkout, a SHARED SERVER checkout under a system path such as `/opt/linear-cli`, and a plain
+  # dev clone that another project's own `bin/linear` `exec`s DIRECTLY — working tree and all, with no
+  # Gemfile, no bundle and no deploy gate between an edit and another team's ticketing. Two failure
+  # modes, both silent until now:
   #
   #   * STALE — measured during AGT-217: the plain clone sat one commit behind `origin/main` after
   #     v2.6.0 was tagged, so ORC kept getting comments newest-first long after the fix shipped and
@@ -29,7 +30,8 @@ module LinearCli
   # immediately after `git push` (see README, "Releasing").
   #
   # CLI-only: `exe/linear` calls this, NOT `require "linear_cli"`, so a host app driving
-  # Linear::Client from a web request (trader-ai's admin endpoint) never shells out to git mid-request.
+  # Linear::Client from a WEB REQUEST — a consumer's admin endpoint, serving live traffic — never shells
+  # out to git mid-request.
   module Checkout
     # The checkout this file was loaded from — lib/linear_cli/ is two levels below the repo root.
     ROOT = File.expand_path("../..", __dir__)
@@ -40,8 +42,9 @@ module LinearCli
     # Only `lib/` and `exe/` count as "dirty": they are the code the CLI actually executes. Scoping the
     # status this way is also what keeps bundler's vendored copy quiet — bundler rewrites the gemspec of
     # a git-source gem in place, so `M linear_cli.gemspec` is permanent bookkeeping there rather than a
-    # half-finished edit, and crying wolf on every trader-ai `bin/linear` would train the eye to ignore
-    # the one line that matters.
+    # half-finished edit, and crying wolf on every run of a HIGH-FREQUENCY caller — a consumer whose own
+    # `bin/linear` shells out dozens of times an hour — would train the eye to ignore the one line that
+    # matters.
     CODE_PATHS = %w[lib exe].freeze
 
     # Bundler's install layout for a git-source gem (`<bundle path>/bundler/gems/<name>-<shortsha>`).
@@ -73,7 +76,8 @@ module LinearCli
 
         # No release tags: nothing here defines "current", so there is no honest warning to give. This
         # is also what silences bundler's vendored checkout, which clones with a heads-only refspec —
-        # and rightly so, since the Gemfile pin, not this file, is what fixes trader-ai's version.
+        # and rightly so, since the Gemfile pin, not this file, is what fixes a BUNDLED consumer's
+        # version.
         newest = newest_tag(root) or return []
 
         lines = []
