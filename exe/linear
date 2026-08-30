@@ -317,6 +317,29 @@ def reject_unknown_flags!(unknown, cmd)
   abort "Unknown flag(s) for #{cmd}: #{unknown.join(" ")} — run `#{PROG}` with no args for usage."
 end
 
+# Value that follows a value-taking flag, aborting when it is missing instead of binding nil. A
+# dangling `--comment` at the end of ARGV would otherwise leave the body nil and transition the issue
+# with no comment at all — the same silent drop as AGT-209, one token further along.
+def flag_value!(args, index, flag, cmd)
+  value = args[index + 1]
+  abort "#{PROG} #{cmd}: #{flag} requires a value." if value.nil?
+
+  value
+end
+
+# Resolve the [--comment "text" | --comment-file PATH|-] pair shared by the transition commands
+# (close/cancel/reopen). `--comment-file` reuses read_body_file, so `-` reads STDIN — the
+# single-quoted-heredoc form that survives the shell (AGT-201) — and a missing path aborts HERE,
+# before the caller transitions anything, so a closing writeup that could not be read never leaves the
+# issue Done with nothing attached. The two flags are mutually exclusive on purpose: silently
+# preferring one would be the same quiet wrong-body class this whole guard exists for (AGT-267).
+def resolve_comment_flags!(comment, comment_file)
+  abort "Pass either --comment or --comment-file, not both." if comment && comment_file
+  return comment unless comment_file
+
+  read_body_file(comment_file)
+end
+
 # Human-readable parent / sub-issue / relation lines for an issue node returned by
 # CLIENT.find_issue (carries parent/children/relations/inverseRelations). Pure formatting.
 def format_issue_links(issue)
@@ -641,15 +664,21 @@ def warn_dropped_images(identifier, dropped)
 end
 
 def cmd_close(args)
-  identifier = args.shift or abort "Usage: #{PROG} close ISSUE-N [--comment \"reason\"]"
-  comment = nil
+  usage = "Usage: #{PROG} close ISSUE-N [--comment \"reason\" | --comment-file PATH|-]"
+  identifier = args.shift or abort usage
+  comment = comment_file = nil
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--comment" then comment = args[i + 1]; i += 2
+    when "--comment"      then comment      = flag_value!(args, i, "--comment", "close"); i += 2
+    when "--comment-file" then comment_file = flag_value!(args, i, "--comment-file", "close"); i += 2
+    when /\A--/           then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "close")
+  comment = resolve_comment_flags!(comment, comment_file)
 
   res = CLIENT.transition(identifier, :done, comment: comment)
   updated = res[:issue]
@@ -760,13 +789,16 @@ end
 def cmd_start(args)
   identifier = args.shift or abort "Usage: #{PROG} start ISSUE-N [--session \"name\"]"
   session_name = nil
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--session" then session_name = args[i + 1]; i += 2
+    when "--session" then session_name = flag_value!(args, i, "--session", "start"); i += 2
+    when /\A--/      then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "start")
 
   body = session_name && "Session started: #{session_name} | Agent: Claude | #{ts}"
   res  = CLIENT.transition(identifier, :in_progress, comment: body)
@@ -808,18 +840,21 @@ end
 def cmd_review(args)
   identifier = args.shift or abort "Usage: #{PROG} review ISSUE-N [--sha <sha>] [--repo owner/name] [--merged|--not-merged] [--deploy|--no-deploy]"
   sha = repo = merged = deploy = nil
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--sha"        then sha    = args[i + 1]; i += 2
-    when "--repo"       then repo   = args[i + 1]; i += 2
+    when "--sha"        then sha    = flag_value!(args, i, "--sha", "review");  i += 2
+    when "--repo"       then repo   = flag_value!(args, i, "--repo", "review"); i += 2
     when "--merged"     then merged = true;  i += 1
     when "--not-merged" then merged = false; i += 1
     when "--deploy"     then deploy = true;  i += 1
     when "--no-deploy"  then deploy = false; i += 1
+    when /\A--/         then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "review")
 
   body = sha && review_comment(sha, repo: repo, merged: merged, deploy: deploy)
   res  = CLIENT.transition(identifier, :in_review, comment: body)
@@ -860,19 +895,27 @@ def cmd_label(args)
 end
 
 def cmd_cancel(args)
-  identifier = args.shift or abort "Usage: #{PROG} cancel ISSUE-N [--comment \"reason\"]"
-  comment = nil
+  usage = "Usage: #{PROG} cancel ISSUE-N [--comment \"reason\" | --comment-file PATH|-]"
+  identifier = args.shift or abort usage
+  comment = comment_file = nil
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--comment" then comment = args[i + 1]; i += 2
+    when "--comment"      then comment      = flag_value!(args, i, "--comment", "cancel"); i += 2
+    when "--comment-file" then comment_file = flag_value!(args, i, "--comment-file", "cancel"); i += 2
+    when /\A--/           then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "cancel")
+  comment = resolve_comment_flags!(comment, comment_file)
 
   res = CLIENT.transition(identifier, :canceled, comment: comment)
   updated = res[:issue]
   puts "Canceled #{updated["identifier"]} → #{updated.dig("state", "name")}"
+  # Say so explicitly: a transition line on its own is exactly what a swallowed body looked like.
+  puts "Comment added." if comment
 end
 
 # Full-text dedup search — relevance-ranked across title + description, ALL states (Done/Canceled
@@ -915,17 +958,24 @@ end
 # work. Keeps the original repro, history, and merged-SHA trail. Defaults to Todo; --in-progress
 # reopens straight to active.
 def cmd_reopen(args)
-  identifier = args.shift or abort "Usage: #{PROG} reopen ISSUE-N [--in-progress] [--comment \"why it recurred\"]"
+  usage = "Usage: #{PROG} reopen ISSUE-N [--in-progress] " \
+          "[--comment \"why it recurred\" | --comment-file PATH|-]"
+  identifier = args.shift or abort usage
   to_progress = false
-  comment     = nil
+  comment = comment_file = nil
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
     when "--in-progress", "--in_progress" then to_progress = true; i += 1
-    when "--comment"                      then comment = args[i + 1]; i += 2
+    when "--comment"                      then comment      = flag_value!(args, i, "--comment", "reopen"); i += 2
+    when "--comment-file"                 then comment_file = flag_value!(args, i, "--comment-file", "reopen"); i += 2
+    when /\A--/                           then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "reopen")
+  comment = resolve_comment_flags!(comment, comment_file)
 
   body = comment || "Reopened — recurrence of previously-closed work. #{ts}"
   res  = CLIENT.reopen(identifier, to_progress: to_progress, comment: body)
@@ -940,13 +990,16 @@ def cmd_relate(args)
   a = args.shift or abort "Usage: #{PROG} relate ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]"
   b = args.shift or abort "Usage: #{PROG} relate ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]"
   type = "related"
+  unknown = []
   i = 0
   while i < args.length
     case args[i]
-    when "--type" then type = (args[i + 1] || "related").downcase; i += 2
+    when "--type" then type = flag_value!(args, i, "--type", "relate").downcase; i += 2
+    when /\A--/   then unknown << args[i]; i += 1
     else i += 1
     end
   end
+  reject_unknown_flags!(unknown, "relate")
 
   res = CLIENT.relate(a, b, type: type)
   if res[:type] == "blocked-by"
@@ -1039,7 +1092,7 @@ def run(argv = ARGV)
                 and/or description in place, in ONE call (posts NO comment)
                 └─ title + description = the current state ("now"); comments = how it got here. Rich markdown? use
                    --desc-file -  with a SINGLE-quoted heredoc:  #{PROG} edit ISSUE-N --desc-file - <<'MD' … MD
-        reopen  ISSUE-N [--in-progress] [--comment "why"]   move a Done/Canceled issue back (recurrence)
+        reopen  ISSUE-N [--in-progress] [--comment "why" | --comment-file PATH|-]   move a Done/Canceled issue back
         parent  CHILD PARENT                  make CHILD a sub-issue of an epic (native hierarchy + rollup)
         relate  ISSUE-N ISSUE-M [--type related|blocks|blocked-by|duplicate|similar]   link two issues (real Linear relation)
         unrelate ISSUE-N ISSUE-M                          remove the relation(s) between two issues (inverse of relate)
@@ -1060,8 +1113,10 @@ def run(argv = ARGV)
         comment-delete  ISSUE-N <comment-id>            delete a comment (e.g. a stray/mistaken one)
         attach  ISSUE-N PATH [PATH ...] [--note "..."]  attach screenshot(s) — repro/QA evidence
         label   ISSUE-N <label>                         add a label (auto-creates it if missing)
-        close   ISSUE-N [--comment "reason"]           mark Done (verified on prod)
-        cancel  ISSUE-N [--comment "reason"]           mark Canceled (duplicates / won't-do)
+        close   ISSUE-N [--comment "reason" | --comment-file PATH|-]   mark Done (verified on prod)
+                └─ a closing writeup is the LONGEST body in the lifecycle and full of backticks — pass it as
+                   --comment-file -  with a SINGLE-quoted heredoc:  #{PROG} close ISSUE-N --comment-file - <<'MD' … MD
+        cancel  ISSUE-N [--comment "reason" | --comment-file PATH|-]   mark Canceled (duplicates / won't-do)
 
       Labels auto-create on first use, so --label Bug works even before the label exists.
 

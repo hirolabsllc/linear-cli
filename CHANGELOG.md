@@ -1,5 +1,46 @@
 # Changelog
 
+## [2.12.0] — 2026-08-30
+
+**The transition subcommands stopped swallowing unrecognized flags, and `close`/`cancel`/`reopen`
+gained `--comment-file` (AGT-209, AGT-267).**
+
+`bin/linear close AKA-2656 --comment-file - <<'MD' … MD` printed `Closed AKA-2656: … → Done`, exited
+**0**, moved the issue to Done — and attached **nothing**. The body survived only because it was
+still in terminal scrollback. The same failure destroyed AKA-1277's entire writeup in July,
+unrecoverably, via a different wrong flag (`comment --file`).
+
+`reject_unknown_flags!` had existed since v2.4.0 (AGT-83) and was correct. The defect was **which
+parsers fed it**: that round landed on the body-taking commands and never reached the transition
+commands, whose parsers were bare loops ending in `else i += 1`, collecting no `unknown` array and so
+unable to call the helper at all. The split was exactly seven to six:
+
+```
+VALIDATED   create · comment · comment-edit · comment-delete · priority · set · edit
+SWALLOWED   close · cancel · reopen · start · review · relate
+```
+
+- **All six now reject an unknown flag by name and exit 1 — before the transition.** A mistyped flag
+  can no longer move an issue to Done while quietly discarding the reason it was closed. This was the
+  fourth recorded instance and each arrived through a *different* wrong flag on a *different*
+  subcommand (`comment --file`, `create --help`, `close --body-file`, `close --comment-file`), so all
+  six were fixed in one pass rather than chasing the last one guessed.
+- **`close`, `cancel` and `reopen` accept `--comment-file PATH|-`**, reusing `read_body_file` — the
+  same helper `comment`/`edit` use, so `-` reads STDIN and a single-quoted heredoc reaches Linear
+  byte-for-byte with backticks, code fences, `$VAR` and backslashes intact (AGT-201). A closing
+  writeup is the longest body in the lifecycle and the one most full of backticks, and until now it
+  had no file/stdin form at all — only the shell-mangling positional.
+- **A missing `--comment-file` path aborts with `Body file not found:` and does NOT transition.** The
+  body is resolved before the state change, so a ticket is never left Done with its writeup missing.
+- **`--comment` together with `--comment-file` is an error**, not a silent precedence rule.
+- **A value-taking flag with no value aborts** (`--comment` as the last token used to bind `nil` and
+  transition with no comment) — the same quiet drop, one token further along.
+- `cancel` now prints `Comment added.` like `close` does: a bare transition line is precisely what a
+  swallowed body looked like.
+
+Regression tests land in `test/cli/transition_flags_test.rb`; all 16 new-behavior assertions were
+confirmed **failing against the pre-fix parser** before the fix, then green after.
+
 ## [2.11.0] — 2026-08-29
 
 **`review` and `commit` no longer assert a merge, a deploy, or a repo they cannot prove (AGT-212).**
