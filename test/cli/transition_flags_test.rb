@@ -263,4 +263,126 @@ class CliTransitionFlagsTest < LinearCli::TestCase
     assert_match(/requires a value/, err)
     assert_empty calls
   end
+
+  # --- AGT-277: a stray POSITIONAL was the last unguarded door in this series -------------------
+  #
+  # v2.12.0 (AGT-209) gave these six an `unknown` accumulator, but only for tokens starting with
+  # `--`. The `else i += 1` branch stayed, so a bare word was still stepped over in silence:
+  # `close ISSUE-N "verified on prod"` moved the issue to Done, exited 0, printed the success line
+  # and attached NOTHING — it did not even print "Comment added.", so the only signal was an absence.
+  # `comment ISSUE-N "body"` takes its body as a positional, so typing that shape at `close` is the
+  # natural mistake, and what vanishes is a closing writeup.
+  #
+  # The resolution is split by whether the subcommand HAS a body: close/cancel/reopen now read a
+  # positional as the comment body (so `close X "reason"` means what it looks like it means, and
+  # matches `comment X "body"`), under the same either/or rule as the two flags; start/review/relate
+  # have no body to put one in, so they abort and name the token.
+
+  test "close ISSUE-N \"reason\" attaches the positional as the comment body" do
+    calls, aborted, = drive(:cmd_close, ["ISSUE-1", "verified on prod"])
+    refute aborted, "a positional body must be accepted, not rejected"
+    assert_equal 1, calls.length, "the issue should still transition"
+    assert_equal "verified on prod", calls.first[1][:comment],
+                 "the positional must reach the client as the comment body, not be dropped"
+  end
+
+  test "close with a positional body AND --comment aborts instead of silently picking one" do
+    calls, aborted, err = drive(:cmd_close, ["ISSUE-1", "positional", "--comment", "flag"])
+    assert aborted, "two competing bodies must be an error, not a precedence rule"
+    assert_match(/not both/, err)
+    assert_empty calls
+  end
+
+  test "close with a positional body AND --comment-file aborts" do
+    calls, aborted, err = with_stdin(StringIO.new(NASTY)) do
+      drive(:cmd_close, ["ISSUE-1", "positional", "--comment-file", "-"])
+    end
+    assert aborted
+    assert_match(/not both/, err)
+    assert_empty calls
+  end
+
+  # The classic unquoted body: the shell has already split it, so joining it back would attach a
+  # body whose whitespace no longer matches what was typed. Name the leftovers and stop.
+  test "close with an UNQUOTED multi-word body aborts naming the extra words" do
+    calls, aborted, err = drive(:cmd_close, ["ISSUE-1", "verified", "on", "prod"])
+    assert aborted, "an unquoted body must not be silently truncated to its first word"
+    assert_match(/"on", "prod"/, err)
+    assert_empty calls, "the issue must NOT be closed when its body was ambiguous"
+  end
+
+  test "close with a blank positional body aborts rather than closing with nothing attached" do
+    calls, aborted, err = drive(:cmd_close, ["ISSUE-1", "   "])
+    assert aborted
+    assert_match(/body is empty/, err)
+    assert_empty calls
+  end
+
+  # `--` is end-of-options for `comment`; close/cancel/reopen take a body now, so they honour it too
+  # and a body that opens with `--` still reaches the client (AGT-201's escape hatch).
+  test "close -- lets a body that starts with dashes through as the body" do
+    calls, aborted, = drive(:cmd_close, ["ISSUE-1", "--", "--not-a-flag, a body"])
+    refute aborted
+    assert_equal "--not-a-flag, a body", calls.first[1][:comment]
+  end
+
+  test "a bare close with no body at all still closes, attaching nothing" do
+    calls, aborted, = drive(:cmd_close, ["ISSUE-1"])
+    refute aborted, "close with no body is legitimate and must keep working"
+    assert_equal 1, calls.length
+    assert_nil calls.first[1][:comment]
+  end
+
+  test "cancel ISSUE-N \"reason\" attaches the positional as the comment body" do
+    calls, aborted, = drive(:cmd_cancel, ["ISSUE-1", "superseded by ISSUE-2"])
+    refute aborted
+    assert_equal "superseded by ISSUE-2", calls.first[1][:comment]
+  end
+
+  test "cancel with a positional body AND --comment aborts" do
+    calls, aborted, err = drive(:cmd_cancel, ["ISSUE-1", "positional", "--comment", "flag"])
+    assert aborted
+    assert_match(/not both/, err)
+    assert_empty calls
+  end
+
+  test "reopen ISSUE-N \"why\" attaches the positional as the comment body" do
+    calls, aborted, = drive(:cmd_reopen, ["ISSUE-1", "recurred on prod"], stub: :reopen, returns: REOPEN_RESULT)
+    refute aborted
+    assert_equal "recurred on prod", calls.first[1][:comment]
+  end
+
+  test "reopen with a positional body AND --comment-file aborts" do
+    calls, aborted, err = with_stdin(StringIO.new("x")) do
+      drive(:cmd_reopen, ["ISSUE-1", "positional", "--comment-file", "-"],
+            stub: :reopen, returns: REOPEN_RESULT)
+    end
+    assert aborted
+    assert_match(/not both/, err)
+    assert_empty calls
+  end
+
+  # --- start / review / relate have no body, so a positional can only be a mistake ---------------
+
+  test "start rejects a stray positional by name and does NOT transition" do
+    calls, aborted, err = drive(:cmd_start, ["ISSUE-1", "AGT-277 (Bug): fix"])
+    assert aborted, "start swallowed a stray positional"
+    assert_match(/AGT-277 \(Bug\): fix/, err)
+    assert_empty calls, "a stray positional must not still move the issue to In Progress"
+  end
+
+  test "review rejects a stray positional by name and does NOT transition" do
+    calls, aborted, err = drive(:cmd_review, ["ISSUE-1", "abc1234"])
+    assert aborted, "review swallowed a stray positional"
+    assert_match(/abc1234/, err)
+    assert_empty calls, "a SHA passed positionally must not be dropped while the issue moves"
+  end
+
+  test "relate rejects a stray third positional by name and does NOT create the relation" do
+    calls, aborted, err = drive(:cmd_relate, ["ISSUE-1", "ISSUE-2", "duplicate"],
+                                stub: :relate, returns: RELATE_RESULT)
+    assert aborted, "relate swallowed a stray positional"
+    assert_match(/duplicate/, err)
+    assert_empty calls
+  end
 end
