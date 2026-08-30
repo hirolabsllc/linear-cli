@@ -49,9 +49,10 @@ linear create "Title" --team ENG --label Bug --priority high --desc "body"
 linear start  ENG-12 --session "my session"      # → In Progress
 linear review ENG-12 --sha <sha>                 # → In Review (+ commit link, if it can be proven)
 linear review ENG-12 --sha <sha> --repo owner/name   # …when the commit lives in ANOTHER repo
-linear close  ENG-12 --comment "verified"        # → Done
+linear close  ENG-12 "verified"                  # → Done, with that as the closing comment
+linear close  ENG-12 --comment "verified"        # …the same thing, spelled as a flag
 linear close  ENG-12 --comment-file -            # …closing writeup from STDIN (heredoc-safe)
-linear cancel ENG-12 --comment-file notes.md     # cancel/reopen take the same pair
+linear cancel ENG-12 --comment-file notes.md     # cancel/reopen take the same trio
 linear view   ENG-12                             # parent / sub-issues / relations + comment ids
 linear list   --status in_progress --team ENG     # EVERY match, paginated; --limit N caps it
 

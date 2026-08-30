@@ -1,5 +1,57 @@
 # Changelog
 
+## [2.14.0] — 2026-08-30
+
+**BEHAVIOUR CHANGE — the six transition subcommands no longer step over a bare argument (AGT-277).**
+v2.12.0 made `close` / `cancel` / `reopen` / `start` / `review` / `relate` reject unknown **flags**,
+but the guard only ever saw tokens starting with `--`. The `else i += 1` branch stayed, so a
+**positional** was still swallowed in silence:
+
+```
+$ linear close ISSUE-N "verified on prod"
+Closed ISSUE-N: … → Done        # exit 0 — and nothing attached
+```
+
+It did not even print `Comment added.`, so the only signal was an absence. `comment ISSUE-N "body"`
+takes its body as a positional, so that is the shape callers already know; typing it at `close` is
+the natural mistake, and what vanished was a closing writeup.
+
+**`close` / `cancel` / `reopen` now read a positional as the comment body**, so the obvious spelling
+means what it looks like it means and `close X "reason"` matches `comment X "body"`:
+
+```bash
+linear close ISSUE-N "verified on prod"       # same as --comment "verified on prod"
+```
+
+The body may come from **exactly one** of three places — a positional, `--comment`, or
+`--comment-file` — resolved together in `resolve_comment_flags!` under the either/or rule the two
+flags already had. Giving two is an error, and v2.12.1's blank-body guard now covers the positional
+too, so a body can never be silently dropped or silently preferred.
+
+An **unquoted** multi-word body has already been split by the shell, so it aborts naming the
+leftovers rather than attaching a body whose whitespace is no longer the one that was typed:
+
+```
+$ linear close ISSUE-N verified on prod
+linear close: unexpected extra argument(s) after the comment body: "on", "prod" — quote the whole
+body as ONE argument (linear close ISSUE-N "..."), or pass it with --comment-file - and a heredoc.
+```
+
+These three also honour POSIX `--` end-of-options now, as `comment` has since v2.5.0 (AGT-201), so a
+reason that itself opens with `--` still reaches the client.
+
+**`start` / `review` / `relate` abort and name the token**, since none of them has a body to put one
+in. Each was a real drop, not a hypothetical: `review ISSUE-N abc1234` moved the issue to In Review
+with **no commit recorded at all**, and `relate A B duplicate` created a plain `related` link while
+stepping over the `--type` value.
+
+```
+$ linear review ISSUE-N abc1234
+linear review: unexpected argument(s): "abc1234" — Usage: linear review ISSUE-N [--sha <sha>] …
+```
+
+Nothing transitions in any of the aborting cases — the guard runs before the mutation, as in v2.12.0.
+
 ## [2.13.0] — 2026-08-30
 
 **BEHAVIOUR CHANGE — `review` no longer claims a deploy for any repo unless you configure one
