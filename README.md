@@ -154,6 +154,70 @@ still rejected (a typo like `comment ENG-12 --show` errors instead of posting ju
 Every command except `create` / `list` takes an issue id (e.g. `ENG-12`) and resolves its team
 automatically — no `--team` needed. Run `linear` with no args for the full command list.
 
+## Exit codes — and writes whose outcome is unknown
+
+A caller needs to tell three things apart, and until v2.18.0 they all left through `exit 1`:
+
+| code | meaning | what a caller should do |
+|---|---|---|
+| `0` | success | — |
+| `1` | **refused** — nothing was written (validation error, bad argument, mistyped command, missing issue, no API key) | fix the input, re-run the same command |
+| `75` | **UNKNOWN** — the request left this client and Linear never answered, so the write **may have committed** | **census first**, then retry only what is genuinely missing |
+| `76` | **partial** — the primary object landed but a follow-up step did not | retry the **steps**, never the create |
+
+`75` exists because "failed" was a claim the client could not support. Measured 2026-09-05 during a
+Linear slowdown (light queries ~0.2 s, heavier ones 16 s+, rate limit untouched at 2498/2500 — latency,
+not throttling):
+
+```
+$ linear create "…" --related AKA-1 --related AKA-2 --related AKA-3 --related AKA-4
+Linear error: Linear request failed after 4 attempt(s): Net::ReadTimeout
+```
+
+The issue **existed** (AKA-2787, `createdAt` 20:34:20Z). The mutation had committed; only the response
+read timed out — and the create had died *after* `issueCreate` and *before* the four relation calls, so
+the issue was sitting there with none of them and nothing said so.
+
+Three things changed (AGT-280):
+
+* **A mutation that was already sent is never re-sent.** The transport now fails the connect phase and
+  the request phase separately, so "we never reached Linear" (safe to re-send) is distinguishable from
+  "Linear has our mutation and never answered" (not safe). Reads keep the old retry behaviour, and so
+  do the mutations that cannot duplicate — every `issueUpdate`/`commentUpdate` writing fixed values,
+  and every delete-by-id.
+* **The client censuses before it re-sends.** `issueCreate` looks itself up by exact title within the
+  team; `commentCreate` by exact body on the issue; `issueRelationCreate` by type + related id. If the
+  object is there, it is adopted (`create` reports `recovered: true`) — if it provably is not, the
+  mutation is re-sent. If the census itself cannot answer, the outcome stays unknown and nothing is
+  re-sent.
+* **Partial success is reported.** A create returns its issue even when link steps fail, each step
+  carrying `ok:` and `error:`, and the CLI prints the exact `relate`/`parent` commands that would
+  finish the job. Same for a transition whose comment did not attach: the state change is reported,
+  the outstanding comment is named, exit `76`.
+
+Censusing by hand, if you need to (this is what the client now does for you):
+
+```bash
+linear search "<the title, or a phrase from the body>"   # did the create land?
+linear comments ISSUE-N                                  # did the comment land?
+linear view ISSUE-N                                      # did the relations land?
+```
+
+In a script, branch on the code rather than on the text:
+
+```bash
+linear create "$TITLE" --label Bug
+case $? in
+  0)  ;;                                        # done
+  76) echo "created, links outstanding — see stderr" ;;
+  75) echo "UNKNOWN — census before retrying" ;;  # never blind-retry this one
+  *)  echo "refused" ;;
+esac
+```
+
+Note that a pipeline reports its **last** command's status, so `linear create … | tail -3` is always
+`0`. Check `${PIPESTATUS[0]}`, or don't pipe.
+
 ## Library usage
 
 ```ruby

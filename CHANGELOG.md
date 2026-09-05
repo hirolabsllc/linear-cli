@@ -1,5 +1,110 @@
 # Changelog
 
+## [2.18.0] — 2026-09-05
+
+**A "failed" write that had committed, and a retry loop that would happily have committed it four
+times ([AGT-280](https://linear.app/hgl-ai/issue/AGT-280)).**
+
+Measured live on 2026-09-05 ~20:30–21:00 UTC from trader-ai, during a Linear backend slowdown where
+light queries answered in ~0.2 s but heavier ones took 16 s+ — above the client's read timeout. The
+rate limit was untouched (2498/2500 requests remaining), so this was latency, not throttling:
+
+```
+$ bin/linear create "…" --related AKA-1 --related AKA-2 --related AKA-3 --related AKA-4
+Linear error: Linear request failed after 4 attempt(s): Net::ReadTimeout
+```
+
+The issue **existed** — AKA-2787, `createdAt` 20:34:20Z, sitting on the board with **zero** of its
+four requested relations. The mutation had committed; only the response read timed out. Every one of
+the four defects in that single line is fixed here.
+
+### 1. "Sent, no response" is not "failed"
+
+`Net::ReadTimeout` is *by definition* raised after the request was written. The client could not say
+so, because `Net::HTTP#request` on an unstarted connection does connect, write and read in one call —
+so a DNS failure and a timed-out mutation arrived as the same exception and the retry loop treated
+both as re-sendable. `#perform_request` now starts the connection separately, which is the only seam
+that separates them:
+
+| phase | raised by | verdict |
+|---|---|---|
+| `:connect` | `Net::HTTP#start` — DNS, TCP, TLS handshake | provably **not sent**; retry anything |
+| `:request` | `Net::HTTP#request` — at or after the write | **may have been sent**; a mutation is never re-sent |
+
+A raw transport exception that reaches `#graphql` without phase information (a stub, another
+transport) is classified by class instead, against the new `PRE_SEND_ERRORS` list. `Net::ReadTimeout`
+is deliberately not on it.
+
+### 2. Non-idempotent mutations are no longer re-sent blind
+
+`MAX_ATTEMPTS = 4` applied to `issueCreate` / `commentCreate` / `issueRelationCreate` is a duplicate
+factory; it did not fire on 2026-09-05 only because the backend was slow enough that every attempt
+timed out on the read rather than fast enough to accept several. A sent mutation now raises the new
+`Linear::Client::UnknownOutcome` (a subclass of `ApiError`, so a host controller's `rescue_from` still
+maps it to 502) instead of being re-sent.
+
+Reads are untouched. So are the mutations that *cannot* duplicate — every `issueUpdate` /
+`commentUpdate` writing FIXED values, and every delete-by-id — which now pass `idempotent: true` and
+keep the old, more forgiving retry. `429` still retries even for a create: a rate limiter rejects
+before it processes, which is the one status that is proof of non-processing. A `5xx` is not — the
+server answered, so it had the write — and is now an unknown outcome for a mutation.
+
+### 3. Census before you re-send
+
+Refusing to retry would have made the client honest and less useful. So the recovery that actually
+worked by hand during the incident is now what the client does:
+
+| mutation | census |
+|---|---|
+| `issueCreate` | `issues(filter: { team, title: { eq } })`, narrowed to a 10-minute window |
+| `commentCreate` | `issue(id:).comments`, matched on the exact body |
+| `issueRelationCreate` | `issue(id:).relations`, matched on type + related id |
+
+Found ⇒ adopt it (`create` returns `recovered: true`). Provably absent ⇒ re-send, safely. Census
+can't answer ⇒ the outcome stays UNKNOWN and nothing is re-sent. Title matching is a direct field
+filter rather than `searchIssues`, which is index-backed and can lag the write it is meant to find.
+
+### 4. Partial success is visible, and the exit code says which kind of failure it was
+
+`create` no longer loses the issue when a link step fails: every step is individually guarded and
+reports `ok:` plus `error:`, and a transition that changes state but cannot attach its comment reports
+both halves rather than surfacing as a flat failure (the body AGT-277 called the most expensive in the
+lifecycle). And there are now three distinct failure codes instead of one:
+
+| code | meaning |
+|---|---|
+| `1` | **refused** — nothing was written (unchanged, so [AGT-275](https://linear.app/hgl-ai/issue/AGT-275)'s mistyped-command contract is untouched) |
+| `75` | **UNKNOWN** — the write may have committed; census, never blind-retry |
+| `76` | **partial** — the object landed, a follow-up step did not; stderr names the exact `relate`/`comment` retry |
+
+### Before / after, same probe
+
+A real `Net::HTTP` whose reads answer normally and whose `issueCreate` is written to the wire and
+never answered, driven end-to-end through `exe/linear` (`create "…" --related AKA-1`), with the issue
+present in the census:
+
+| | v2.17.0 | v2.18.0 |
+|---|---|---|
+| `issueCreate` sends to the wire | **4** | **1** |
+| what it said | `Linear request failed after 4 attempt(s)` | `RECOVERED by census, not created twice` |
+| the issue id | never printed | `AGT-2787` + url on stdout |
+| the missing relation | silent | named, with `linear relate AGT-2787 AKA-1 --type related` |
+| exit | `1` — same as a refusal | `76` |
+
+With the issue genuinely absent, the create is re-sent (each time against a census that proved
+absence) and, if it still never answers, exits `75` with the census commands on stderr.
+
+One correction to the ticket, worth recording: AGT-280 item 4 says the failure exits **0**. It does
+not — `exe/linear` has rescued to `exit 1` all along. That measurement was taken through
+`bin/linear create … | tail -3`, and a pipeline's status is its **last** command's. The derived
+requirement stands and is what shipped: one failure code could not distinguish "refused" from
+"unknown".
+
+Covered by `test/linear/unknown_outcome_test.rb` (16 tests, driving the real `#perform_request`
+against a fake `Net::HTTP` that fails the connect and request phases independently),
+`test/linear/census_recovery_test.rb` (15) and `test/cli/exit_codes_test.rb` (15). Suite: 284 tests,
+1056 assertions, 0 failures.
+
 ## [2.17.0] — 2026-08-30
 
 **The staleness check can finally see a tag the checkout has never fetched (AGT-231).**

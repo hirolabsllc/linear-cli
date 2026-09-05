@@ -573,6 +573,13 @@ def cmd_create(args)
   issue = result[:issue]
   puts "#{issue["identifier"]}: #{issue["title"]}"
   puts issue["url"]
+  # stdout is block-buffered when piped, stderr is not — flush so the id that DOES exist is not
+  # printed after the warnings about what is missing from it.
+  $stdout.flush
+  # The create timed out, the census found the issue already there, and we carried on with its id
+  # instead of minting a second ticket. Worth saying out loud — the caller asked for a create and got
+  # an adoption (AGT-280).
+  warn "  ↳ note: the create timed out and this issue was RECOVERED by census, not created twice." if result[:recovered]
 
   # --- Dependency links — applied AT create time so they're never forgotten ----
   result[:links].each do |lk|
@@ -581,9 +588,33 @@ def cmd_create(args)
     if lk[:ok]
       puts "  #{verb} #{lk[:identifier]}"
     else
-      warn "  ! could not link #{lk[:kind].tr("_", " ")} #{lk[:ref]}"
+      warn "  ! could not link #{lk[:kind].tr("_", " ")} #{lk[:ref]}#{lk[:error] ? " — #{lk[:error]}" : ""}"
     end
   end
+
+  # The issue EXISTS but is not what was asked for. AKA-2787 was created with zero of its four
+  # --related relations and NOTHING said so, because a link failure only warned and the command still
+  # exited 0 — indistinguishable from a complete create to any script. Name the outstanding steps and
+  # exit 76 so a retry fixes the LINKS rather than re-creating the ticket (AGT-280).
+  if result[:incomplete]
+    missing = result[:links].reject { |lk| lk[:ok] }
+    $stdout.flush
+    warn "  ! INCOMPLETE: #{issue["identifier"]} was created, but #{missing.length} of " \
+         "#{result[:links].length} link step(s) did not apply."
+    warn "  ↳ retry just the missing links (do NOT re-run create):"
+    missing.each { |lk| warn "      #{PROG} #{link_retry_hint(issue["identifier"], lk)}" }
+    exit LinearCli::EXIT_PARTIAL
+  end
+end
+
+# The command that would apply ONE link step that failed during a create. Direction matters:
+# `--blocked-by X` means "X blocks NEW", so it is spelled `--type blocked-by`; a parent is its own
+# subcommand, not a relation.
+def link_retry_hint(identifier, link)
+  return "parent #{identifier} #{link[:ref]}" if link[:kind] == "parent"
+
+  type = { "blocks" => "blocks", "blocked_by" => "blocked-by" }[link[:kind]] || "related"
+  "relate #{identifier} #{link[:ref]} --type #{type}"
 end
 
 def cmd_view(args)
@@ -834,6 +865,21 @@ def warn_dropped_images(identifier, dropped)
        "or add fresh evidence with: #{PROG} attach #{identifier} PATH"
 end
 
+# A transition is TWO writes — the state change, then the comment — and the state change lands first.
+# When the comment step does not apply, the issue HAS moved, so this is a partial success, not a
+# failure: report both halves, name the retry that fixes only the missing half, and exit 76 so a
+# script can tell it from a clean transition (AGT-280; the body at stake is AGT-277's point).
+def report_transition_comment!(res, identifier, body)
+  return if body.nil? || res[:comment_ok] != false
+
+  $stdout.flush
+  warn "  ! INCOMPLETE: #{identifier} DID change state, but the comment did not attach" \
+       "#{res[:comment_error] ? " — #{res[:comment_error]}" : ""}."
+  warn "  ↳ the state change is done; retry only the comment (check `#{PROG} comments #{identifier}` first):"
+  warn "      #{PROG} comment #{identifier} --body-file - <<'MD' … MD"
+  exit LinearCli::EXIT_PARTIAL
+end
+
 def cmd_close(args)
   usage = usage_for("close")
   identifier = args.shift or abort usage
@@ -859,7 +905,8 @@ def cmd_close(args)
   updated = res[:issue]
   puts "Closed #{updated["identifier"]}: #{updated["title"]} → #{updated.dig("state", "name")}"
   puts updated["url"]
-  puts "Comment added." if comment
+  puts "Comment added." if comment && res[:comment_ok] != false
+  report_transition_comment!(res, updated["identifier"], comment)
 end
 
 def cmd_list(args)
@@ -985,7 +1032,8 @@ def cmd_start(args)
   body = session_name && "Session started: #{session_name} | Agent: Claude | #{ts}"
   res  = CLIENT.transition(identifier, :in_progress, comment: body)
   puts "#{identifier} → #{res[:issue].dig("state", "name")}"
-  puts "Comment: #{body}" if body
+  puts "Comment: #{body}" if body && res[:comment_ok] != false
+  report_transition_comment!(res, identifier, body)
 end
 
 # The In Review comment for a --sha. Every clause has to be something the tool can actually show is
@@ -1046,7 +1094,8 @@ def cmd_review(args)
   body = sha && review_comment(sha, repo: repo, merged: merged, deploy: deploy)
   res  = CLIENT.transition(identifier, :in_review, comment: body)
   puts "#{identifier} → #{res[:issue].dig("state", "name")}"
-  puts "Comment: #{body}" if body
+  puts "Comment: #{body}" if body && res[:comment_ok] != false
+  report_transition_comment!(res, identifier, body)
 end
 
 # Attach a commit to an issue as a comment with a clickable GitHub link + subject. Defaults to HEAD —
@@ -1110,7 +1159,8 @@ def cmd_cancel(args)
   updated = res[:issue]
   puts "Canceled #{updated["identifier"]} → #{updated.dig("state", "name")}"
   # Say so explicitly: a transition line on its own is exactly what a swallowed body looked like.
-  puts "Comment added." if comment
+  puts "Comment added." if comment && res[:comment_ok] != false
+  report_transition_comment!(res, updated["identifier"], comment)
 end
 
 # Full-text dedup search — relevance-ranked across title + description, ALL states (Done/Canceled
@@ -1181,7 +1231,8 @@ def cmd_reopen(args)
   body = comment || "Reopened — recurrence of previously-closed work. #{ts}"
   res  = CLIENT.reopen(identifier, to_progress: to_progress, comment: body)
   puts "#{identifier}: #{res[:from]} → #{res[:to]} (reopened)"
-  puts "Comment: #{body}"
+  puts "Comment: #{body}" if res[:comment_ok] != false
+  report_transition_comment!(res, identifier, body)
 end
 
 # Create a real Linear relation between two issues (shows in the UI, unlike a text "duplicate of
@@ -1381,20 +1432,33 @@ def run(argv = ARGV)
       exit 1
     end
   end
+rescue Linear::Client::UnknownOutcome => e
+  # NOT a failure — an unknown. The request left this client and Linear never answered, so the write
+  # may well have committed: on 2026-09-05 `create` reported exactly this and the issue existed
+  # (AKA-2787). Say so, say what to do about it, and exit on a code a script can branch on (AGT-280).
+  $stdout.flush
+  warn "Linear error (OUTCOME UNKNOWN): #{e.message}"
+  warn "  ↳ This write may ALREADY have been applied. Do not blindly re-run it — census first:"
+  warn "      #{PROG} search \"<the title / a phrase from the body>\"     # did it land?"
+  warn "      #{PROG} comments ISSUE-N                                  # for a comment"
+  warn "      #{PROG} view ISSUE-N                                      # for relations"
+  warn "  ↳ exit #{LinearCli::EXIT_UNKNOWN} means UNKNOWN; exit #{LinearCli::EXIT_REFUSED} means refused (nothing was written)."
+  exit LinearCli::EXIT_UNKNOWN
 rescue Linear::Client::UsageLimited => e
   # Terminal plan/usage limit (e.g. the free-plan active-issue cap). Surface Linear's own upgrade copy.
   warn "Linear error: #{e.message}"
   warn "  ↳ This workspace hit a Linear plan limit. Upgrade at linear.app/settings/billing or contact sales@linear.app, then retry."
-  exit 1
+  exit LinearCli::EXIT_REFUSED
 rescue Linear::Client::RateLimited => e
-  # The client already backed off + retried (MAX_ATTEMPTS) before giving up.
+  # The client already backed off + retried (MAX_ATTEMPTS) before giving up. A 429 is proof Linear
+  # rejected the request WITHOUT processing it, so this one really is "nothing was written".
   warn "Linear error: #{e.message}"
   warn "  ↳ Linear is rate-limiting requests; the client already retried with backoff. Wait a moment and run it again."
-  exit 1
+  exit LinearCli::EXIT_REFUSED
 rescue Linear::Client::Error => e
   # Typed errors from the shared client surface as a clean CLI failure (the client never exits/aborts).
   warn "Linear error: #{e.message}"
-  exit 1
+  exit LinearCli::EXIT_REFUSED
 end
 
 # Autorun unless a test loaded us purely to reach the helpers (see the note on `run`).

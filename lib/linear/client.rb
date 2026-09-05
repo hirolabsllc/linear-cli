@@ -4,6 +4,7 @@ require "net/http"
 require "openssl"
 require "uri"
 require "json"
+require "time"
 
 # Shared Linear GraphQL client — multi-team, default team configurable.
 #
@@ -41,6 +42,21 @@ module Linear
     # (as a wrapped ApiError). A single transient blip must never again silently push a session onto an
     # SSH/box-CLI fallback (AKA-491).
     class StaleStateError < ApiError; end
+
+    # A write whose request LEFT this client but whose response never arrived: a Net::ReadTimeout
+    # after the mutation was on the wire, an EOF mid-response, a 5xx from a gateway that may have
+    # forwarded it. The outcome is UNKNOWN — not failed — and saying "failed" is a lie the caller
+    # acts on. Measured 2026-09-05 (AGT-280): `linear create` printed
+    #   Linear error: Linear request failed after 4 attempt(s): Net::ReadTimeout
+    # for an issue that EXISTED (AKA-2787, createdAt 20:34:20Z). The mutation had committed; only
+    # the response read timed out.
+    #
+    # It is NEVER produced for a read (re-sending a query cannot change anything) and never for a
+    # mutation the transport can prove never left ({PRE_SEND_ERRORS} / a failed connect phase).
+    # Callers that can look — {#create}, {#add_comment}, {#create_relation}, {#find_or_create_label}
+    # — census first and re-send only against a proven absence; callers that cannot let it surface,
+    # and the CLI exits {LinearCli::EXIT_UNKNOWN} so a script censuses instead of blind-retrying.
+    class UnknownOutcome < ApiError; end
 
     # Canonical Linear label colors used when auto-creating a missing label.
     LABEL_COLORS = {
@@ -83,6 +99,39 @@ module Linear
     # NOT mistaken for it — see {StaleStateError}.
     STALE_STATE_PATTERN = /discrepancy between issue team and state/i
 
+    # The subset of {NETWORK_ERRORS} that can only be raised BEFORE a single request byte is written:
+    # DNS resolution, the TCP connect, the TLS handshake. Nothing reached Linear, so re-sending is
+    # safe even for a mutation. Everything else in the list is ambiguous BY CLASS — an ECONNRESET or
+    # an EPIPE says nothing about how many bytes the server already had — which is why the phase the
+    # error was raised in ({#perform_request}) is the real evidence and this list is only the
+    # fallback for a raw exception that arrives without one.
+    PRE_SEND_ERRORS = [
+      Net::OpenTimeout, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::ENETUNREACH, SocketError
+    ].freeze
+
+    # How far back a census looks for the object a timed-out write may have created. Wide enough to
+    # absorb clock skew between this machine and Linear plus the request's own latency (the incident
+    # that produced AGT-280 had ~16 s round-trips), narrow enough that a year-old issue sharing the
+    # title is never adopted as "ours".
+    CENSUS_WINDOW = 600 # seconds
+
+    # One failed round-trip plus the fact this whole fix turns on: whether the request left us.
+    # Internal — {#graphql} always converts it, so it never reaches a caller.
+    class TransportFailure < StandardError
+      # :connect — raised by Net::HTTP#start (DNS / TCP / TLS); the request provably never left.
+      # :request — raised at or after the write; the client cannot see how many bytes arrived, so
+      #            for a non-idempotent mutation the only safe reading is "it may have been applied".
+      attr_reader :original, :phase
+
+      def initialize(original, phase)
+        @original = original
+        @phase    = phase
+        super("#{original.class}: #{original.message}")
+      end
+
+      def sent? = @phase != :connect
+    end
+
     attr_reader :team_key
 
     # The default team comes from LINEAR_DEFAULT_TEAM (or an explicit `team_key:`). There is no
@@ -109,21 +158,35 @@ module Linear
     #                    MAX_ATTEMPTS retries (exponential backoff honoring Retry-After /
     #                    x-ratelimit-*-reset headers).
     #   * ApiError     — any other GraphQL error, a non-JSON body, or a non-2xx HTTP status.
+    #   * UnknownOutcome — a NON-idempotent mutation whose request left this client and got no
+    #                    answer (see {UnknownOutcome}). Never retried here; census, then re-send.
     #
     # The message is built from extensions.userPresentableMessage (falling back to the raw `message`)
     # prefixed with extensions.code, so the real cause surfaces instead of a bare "usage limit exceeded".
-    def graphql(query, variables = {})
+    #
+    # `idempotent:` overrides the query/mutation sniff. Pass `true` for a mutation whose re-send
+    # cannot make a second object — every `issueUpdate`/`commentUpdate` that writes FIXED values, and
+    # every delete-by-id — so those keep the old, more forgiving retry behaviour. Leave it alone for
+    # `*Create`.
+    def graphql(query, variables = {}, idempotent: nil)
       raise ConfigError, "LINEAR_API_KEY not set. Add it to .env — get one at linear.app/settings/api" unless configured?
 
+      idempotent = !mutation?(query) if idempotent.nil?
       attempt = 0
       loop do
         attempt += 1
         begin
           res = perform_request(query, variables)
-        rescue *NETWORK_ERRORS => e
-          # A transport blip (timeout / reset / SSL). Re-sending the same request is the right move —
-          # back off and retry, then surface a clear ApiError rather than crashing with a raw exception.
-          raise ApiError, "Linear request failed after #{attempt} attempt(s): #{e.class}: #{e.message}" if attempt >= MAX_ATTEMPTS
+        rescue TransportFailure, *NETWORK_ERRORS => e
+          # A transport blip (timeout / reset / SSL). For a READ, re-sending is unambiguously right.
+          # For a mutation it is right only while the request provably never left: `sent` is taken
+          # from the phase {#perform_request} failed in, falling back to the exception class when a
+          # raw error arrives without one. A sent mutation is UNKNOWN, not failed — surface it as
+          # such rather than minting a duplicate (AGT-280).
+          cause = e.is_a?(TransportFailure) ? e.original : e
+          sent  = e.is_a?(TransportFailure) ? e.sent? : !PRE_SEND_ERRORS.any? { |k| e.is_a?(k) }
+          raise unknown_outcome("#{cause.class}: #{cause.message}", attempt) if sent && !idempotent
+          raise ApiError, "Linear request failed after #{attempt} attempt(s): #{cause.class}: #{cause.message}" if attempt >= MAX_ATTEMPTS
 
           backoff_pause(exponential_backoff(attempt))
           next
@@ -164,8 +227,12 @@ module Linear
           next
         end
 
-        # 5xx is a transient server-side blip — retry the round-trip before giving up.
+        # 5xx is a transient server-side blip — retry the round-trip before giving up. For a
+        # non-idempotent mutation it is NOT retryable: the request demonstrably reached a server (it
+        # answered), and a 500 or a 504 says nothing about whether the write committed before the
+        # error. Only a 429 is proof of non-processing, and that is handled above.
         if status >= 500
+          raise unknown_outcome("HTTP #{status}: #{truncate(res.body)}", attempt) unless idempotent
           raise ApiError, "Linear returned HTTP #{status} after #{attempt} attempt(s): #{truncate(res.body)}" if attempt >= MAX_ATTEMPTS
 
           backoff_pause(exponential_backoff(attempt))
@@ -245,15 +312,27 @@ module Linear
 
       color = LABEL_COLORS[name.downcase] || "#95a2b3"
       display = name.downcase.split(/[\s_-]+/).map(&:capitalize).join(" ")
-      data = graphql(<<~GQL, { name: display, color: color })
-        mutation($name: String!, $color: String!) {
-          issueLabelCreate(input: { name: $name, color: $color }) {
-            success
-            issueLabel { id name }
+      # issueLabelCreate is not idempotent — a blind re-send after a timeout leaves the workspace
+      # with two "Bug" labels. Census the live label list by name before any re-attempt (AGT-280).
+      id, = with_census("label create #{display.inspect}", -> { existing_label_id(display) }) do
+        data = graphql(<<~GQL, { name: display, color: color })
+          mutation($name: String!, $color: String!) {
+            issueLabelCreate(input: { name: $name, color: $color }) {
+              success
+              issueLabel { id name }
+            }
           }
-        }
-      GQL
-      data.dig("issueLabelCreate", "issueLabel", "id")
+        GQL
+        data.dig("issueLabelCreate", "issueLabel", "id")
+      end
+      id
+    end
+
+    # The id of an existing label named `display`, or nil — the census half of
+    # {#find_or_create_label}. Re-reads the live list rather than trusting the one we already
+    # searched: the whole question is whether our own timed-out create added to it.
+    def existing_label_id(display)
+      labels.find { |l| l["name"].to_s.casecmp?(display) }&.fetch("id", nil)
     end
 
     def priority_value(name)
@@ -343,40 +422,57 @@ module Linear
         input[:labelIds] = [label_id] if label_id
       end
 
-      data = graphql(<<~GQL, { input: input })
-        mutation($input: IssueCreateInput!) {
-          issueCreate(input: $input) {
-            success
-            issue { id identifier title url }
+      # `since` is stamped BEFORE the mutation so the census can tell an issue this call created from
+      # an older one that happens to share the title.
+      since  = Time.now.utc - CENSUS_WINDOW
+      census = -> { census_created_issue(title: title, team_id: input[:teamId], since: since) }
+      issue, recovered = with_census("issue create #{title.inspect}", census) do
+        data = graphql(<<~GQL, { input: input })
+          mutation($input: IssueCreateInput!) {
+            issueCreate(input: $input) {
+              success
+              issue { id identifier title url }
+            }
+          }
+        GQL
+        data.dig("issueCreate", "issue") || raise(ApiError, "Linear refused the issue create")
+      end
+
+      links  = []
+      new_id = issue["id"]
+
+      # Each link step is now INDIVIDUALLY guarded. Before AGT-280 the first one that raised took the
+      # whole create down with it: AKA-2787's create timed out after issueCreate and before its four
+      # --related calls, so the issue existed with ZERO of the relations it was asked for and the
+      # caller was told the create had failed. A step that fails now reports itself and the issue is
+      # always returned, so a retry links what is missing instead of re-creating the ticket.
+      link_step(links, "parent", parent) { |t| set_parent(new_id, t["id"]) } if parent
+      # NEW blocks X ⇒ relation "NEW blocks X"
+      Array(blocks).each { |ref| link_step(links, "blocks", ref) { |t| create_relation(new_id, t["id"], "blocks") } }
+      # NEW blocked by X ⇒ relation "X blocks NEW"
+      Array(blocked_by).each { |ref| link_step(links, "blocked_by", ref) { |t| create_relation(t["id"], new_id, "blocks") } }
+      Array(related).each { |ref| link_step(links, "related", ref) { |t| create_relation(new_id, t["id"], "related") } }
+
+      { issue: issue, links: links, recovered: recovered, incomplete: links.any? { |l| !l[:ok] } }
+    end
+
+    # Census for {#create}: the issue a timed-out `issueCreate` may have committed. Filtered by
+    # Linear on team + exact title (a direct field filter, so it is immediately consistent — unlike
+    # `searchIssues`, which is index-backed and can lag the write it is meant to find), then narrowed
+    # HERE to the {CENSUS_WINDOW} so a year-old ticket with the same title is never adopted as ours.
+    # Newest match wins. This is the recovery that was run by hand on 2026-09-05, promoted into the
+    # client so nobody has to remember it under pressure (AGT-280).
+    def census_created_issue(title:, team_id:, since:)
+      filter = { team: { id: { eq: team_id } }, title: { eq: title } }
+      nodes  = graphql(<<~GQL, { filter: filter, first: 50 }).dig("issues", "nodes") || []
+        query($filter: IssueFilter!, $first: Int!) {
+          issues(filter: $filter, orderBy: createdAt, first: $first) {
+            nodes { id identifier title url createdAt }
           }
         }
       GQL
-      issue = data.dig("issueCreate", "issue")
-      raise ApiError, "Linear refused the issue create" unless issue
-
-      links = []
-      new_id = issue["id"]
-
-      if parent
-        p = find_issue(parent)
-        links << link_result("parent", parent, p, p && set_parent(new_id, p["id"]))
-      end
-      # NEW blocks X ⇒ relation "NEW blocks X"
-      Array(blocks).each do |ref|
-        t = find_issue(ref)
-        links << link_result("blocks", ref, t, t && create_relation(new_id, t["id"], "blocks"))
-      end
-      # NEW blocked by X ⇒ relation "X blocks NEW"
-      Array(blocked_by).each do |ref|
-        t = find_issue(ref)
-        links << link_result("blocked_by", ref, t, t && create_relation(t["id"], new_id, "blocks"))
-      end
-      Array(related).each do |ref|
-        t = find_issue(ref)
-        links << link_result("related", ref, t, t && create_relation(new_id, t["id"], "related"))
-      end
-
-      { issue: issue, links: links }
+      recent = nodes.select { |n| within_census_window?(n["createdAt"], since) }
+      recent.max_by { |n| n["createdAt"].to_s }
     end
 
     # --- title / comment / labels -------------------------------------------
@@ -397,7 +493,9 @@ module Linear
 
       issue = find_issue!(identifier)
       old_title = issue["title"]
-      data = graphql(<<~GQL, { id: issue["id"], title: new_title })
+      # idempotent: an issueUpdate that writes a FIXED value lands the same result however many
+      # times it is applied, so the old forgiving transport retry stays correct here (AGT-280).
+      data = graphql(<<~GQL, { id: issue["id"], title: new_title }, idempotent: true)
         mutation($id: String!, $title: String!) {
           issueUpdate(id: $id, input: { title: $title }) {
             success
@@ -481,7 +579,8 @@ module Linear
     def update_issue(issue_id, input)
       raise InvalidInput, "No fields to update" if input.nil? || input.empty?
 
-      data = graphql(<<~GQL, { id: issue_id, input: input })
+      # idempotent — see {#retitle}: fixed field values, so re-applying changes nothing.
+      data = graphql(<<~GQL, { id: issue_id, input: input }, idempotent: true)
         mutation($id: String!, $input: IssueUpdateInput!) {
           issueUpdate(id: $id, input: $input) {
             success
@@ -574,12 +673,34 @@ module Linear
     end
 
     # Low-level: add a comment to an already-resolved issue id (no extra lookup).
+    #
+    # commentCreate is not idempotent — a blindly re-sent one is a duplicate comment on a permanent
+    # audit trail. On an unknown outcome the issue's own comments are censused by body first, and the
+    # mutation is re-sent only against a proven absence (AGT-280).
     def add_comment(issue_id, body)
-      graphql(<<~GQL, { issueId: issue_id, body: body })
-        mutation($issueId: String!, $body: String!) {
-          commentCreate(input: { issueId: $issueId, body: $body }) { success }
+      since  = Time.now.utc - CENSUS_WINDOW
+      census = -> { census_created_comment(issue_id: issue_id, body: body, since: since) }
+      _value, recovered = with_census("comment create on #{issue_id}", census) do
+        graphql(<<~GQL, { issueId: issue_id, body: body })
+          mutation($issueId: String!, $body: String!) {
+            commentCreate(input: { issueId: $issueId, body: $body }) { success }
+          }
+        GQL
+      end
+      recovered
+    end
+
+    # Census for {#add_comment}: the comment a timed-out `commentCreate` may have posted. Matched on
+    # the EXACT body — the caller hands us the finished markdown, so an identical body inside the
+    # window is our own write and not a coincidence.
+    def census_created_comment(issue_id:, body:, since:)
+      nodes = graphql(<<~GQL, { id: issue_id, first: MAX_PAGE_SIZE }).dig("issue", "comments", "nodes") || []
+        query($id: String!, $first: Int!) {
+          issue(id: $id) { comments(first: $first) { nodes { id body createdAt } } }
         }
       GQL
+      nodes.select { |n| n["body"] == body && within_census_window?(n["createdAt"], since) }
+           .max_by { |n| n["createdAt"].to_s }
     end
 
     # --- comment list / edit / delete (AGT-83) -------------------------------
@@ -648,7 +769,8 @@ module Linear
 
     # Edit a comment's body by comment id. Returns the updated comment node { "id", "body" }.
     def update_comment(comment_id, body)
-      data = graphql(<<~GQL, { id: comment_id, body: body })
+      # idempotent — a fixed body, re-applied.
+      data = graphql(<<~GQL, { id: comment_id, body: body }, idempotent: true)
         mutation($id: String!, $body: String!) {
           commentUpdate(id: $id, input: { body: $body }) {
             success
@@ -663,15 +785,33 @@ module Linear
 
     # Delete a comment by comment id. Returns true on success.
     def delete_comment(comment_id)
-      data = graphql(<<~GQL, { id: comment_id })
+      # idempotent — a delete BY ID creates nothing on a re-send, so the forgiving transport retry
+      # stays. Its one hazard is the retry LANDING TWICE: the first delete succeeds, the re-send is
+      # answered "not found", and the caller is told the delete failed when it plainly did not. So a
+      # refusal is only a refusal while the comment is still there (AGT-280).
+      data = graphql(<<~GQL, { id: comment_id }, idempotent: true)
         mutation($id: String!) {
           commentDelete(id: $id) { success }
         }
       GQL
-      ok = data.dig("commentDelete", "success")
-      raise ApiError, "Linear refused the comment delete (id #{comment_id})" unless ok
+      raise ApiError, "Linear refused the comment delete (id #{comment_id})" unless data.dig("commentDelete", "success")
 
-      ok
+      true
+    rescue ApiError => e
+      raise if e.is_a?(UnknownOutcome) || !comment_gone?(comment_id)
+
+      true
+    end
+
+    # True when no comment with this id exists any more (or Linear cannot tell us, in which case we
+    # do NOT claim the delete worked).
+    def comment_gone?(comment_id)
+      data = graphql("query($id: String!) { comment(id: $id) { id } }", { id: comment_id })
+      # Only an explicit `"comment" => nil` is evidence of absence. A response that simply does not
+      # carry the key answers a different question, and "I did not see it" is not "it is not there".
+      data.is_a?(Hash) && data.key?("comment") && data["comment"].nil?
+    rescue Error
+      false
     end
 
     # Add one or more labels to an issue, preserving existing labels (idempotent — Linear de-dupes by
@@ -689,7 +829,8 @@ module Linear
       GQL
       ids = (existing + label_ids).uniq
 
-      graphql(<<~GQL, { id: issue["id"], labelIds: ids })
+      # idempotent — the full label-id set is computed up front and written wholesale.
+      graphql(<<~GQL, { id: issue["id"], labelIds: ids }, idempotent: true)
         mutation($id: String!, $labelIds: [String!]!) {
           issueUpdate(id: $id, input: { labelIds: $labelIds }) { success }
         }
@@ -716,7 +857,8 @@ module Linear
         states = issue_team_id ? workflow_states_for(issue_team_id) : workflow_states
         state  = find_state(target, states: states, team_label: issue_team_key)
         debug_log { "transition #{identifier} → #{target}: team=#{issue_team_key}(#{issue_team_id}) state=#{state['name']}(#{state['id']}) attempt=#{attempt}" }
-        data = graphql(<<~GQL, { id: issue["id"], stateId: state["id"] })
+        # idempotent — a fixed state id; re-applying it is the same transition.
+        data = graphql(<<~GQL, { id: issue["id"], stateId: state["id"] }, idempotent: true)
           mutation($id: String!, $stateId: String!) {
             issueUpdate(id: $id, input: { stateId: $stateId }) {
               success
@@ -724,8 +866,21 @@ module Linear
             }
           }
         GQL
-        add_comment(issue["id"], comment) if comment && !comment.to_s.empty?
-        { issue: data.dig("issueUpdate", "issue"), from: issue.dig("state", "name") }
+        res = { issue: data.dig("issueUpdate", "issue"), from: issue.dig("state", "name") }
+        # A transition is a TWO-step write, and by here the first step has already landed. Letting a
+        # failed comment escape would report the whole thing as failed for work that half-happened —
+        # the AKA-2787 shape, on the body AGT-277 called the most expensive in the lifecycle. Record
+        # it instead, so the caller can see the state moved AND that the writeup is still outstanding.
+        if comment && !comment.to_s.empty?
+          begin
+            add_comment(issue["id"], comment)
+            res[:comment_ok] = true
+          rescue Error => e
+            res[:comment_ok]    = false
+            res[:comment_error] = brief_error(e)
+          end
+        end
+        res
       rescue StaleStateError => e
         # A wrong-team state id slipped through (stale/partial team↔state resolution). Bust the team +
         # workflow-state caches and re-resolve from scratch, then retry. Only a persistent discrepancy
@@ -745,7 +900,8 @@ module Linear
     # already-closed work, keeping the original history. Returns { identifier:, from:, to: }.
     def reopen(identifier, to_progress: false, comment: nil)
       res = transition(identifier, to_progress ? :in_progress : :todo, comment: comment)
-      { identifier: res[:issue]["identifier"], from: res[:from], to: res[:issue].dig("state", "name") }
+      { identifier: res[:issue]["identifier"], from: res[:from], to: res[:issue].dig("state", "name"),
+        comment_ok: res[:comment_ok], comment_error: res[:comment_error] }
     end
 
     # --- relations & parent --------------------------------------------------
@@ -753,19 +909,38 @@ module Linear
     # Create a real Linear relation. `type` reads in the canonical direction "issueId <type>
     # relatedIssueId" (e.g. blocks). Returns the GraphQL `success` boolean.
     def create_relation(issue_id, related_id, type)
-      data = graphql(<<~GQL, { issueId: issue_id, relatedIssueId: related_id, type: type })
-        mutation($issueId: String!, $relatedIssueId: String!, $type: IssueRelationType!) {
-          issueRelationCreate(input: { issueId: $issueId, relatedIssueId: $relatedIssueId, type: $type }) {
-            success
+      # issueRelationCreate is not idempotent — Linear will happily mint the same edge twice. On an
+      # unknown outcome, look for the edge before re-sending (AGT-280).
+      census = -> { relation_exists?(issue_id, related_id, type) || nil }
+      ok, = with_census("relation #{type} #{issue_id}→#{related_id}", census) do
+        data = graphql(<<~GQL, { issueId: issue_id, relatedIssueId: related_id, type: type })
+          mutation($issueId: String!, $relatedIssueId: String!, $type: IssueRelationType!) {
+            issueRelationCreate(input: { issueId: $issueId, relatedIssueId: $relatedIssueId, type: $type }) {
+              success
+            }
           }
+        GQL
+        data.dig("issueRelationCreate", "success")
+      end
+      ok
+    end
+
+    # True when `issue_id` already carries a `type` relation to `related_id`. The census half of
+    # {#create_relation} — a relation has no client-side id to match on, so the edge itself is the
+    # evidence.
+    def relation_exists?(issue_id, related_id, type)
+      nodes = graphql(<<~GQL, { id: issue_id, first: MAX_PAGE_SIZE }).dig("issue", "relations", "nodes") || []
+        query($id: String!, $first: Int!) {
+          issue(id: $id) { relations(first: $first) { nodes { type relatedIssue { id } } } }
         }
       GQL
-      data.dig("issueRelationCreate", "success")
+      nodes.any? { |n| n["type"] == type && n.dig("relatedIssue", "id") == related_id }
     end
 
     # Make `child` a sub-issue of `parent` (Linear's native epic hierarchy). Returns `success`.
     def set_parent(child_id, parent_id)
-      data = graphql(<<~GQL, { id: child_id, parentId: parent_id })
+      # idempotent — a fixed parent id; setting it twice is one parent, not two.
+      data = graphql(<<~GQL, { id: child_id, parentId: parent_id }, idempotent: true)
         mutation($id: String!, $parentId: String!) {
           issueUpdate(id: $id, input: { parentId: $parentId }) { success }
         }
@@ -818,7 +993,9 @@ module Linear
       ids  = (data.dig("issue", "relations", "nodes") || []).select { |r| r.dig("relatedIssue", "id") == b["id"] }.map { |r| r["id"] }
       ids += (data.dig("issue", "inverseRelations", "nodes") || []).select { |r| r.dig("issue", "id") == b["id"] }.map { |r| r["id"] }
       ids.each do |rid|
-        graphql(<<~GQL, { id: rid })
+        # idempotent — a delete BY ID creates nothing on a re-send; the worst case is a second
+        # "already gone" answer.
+        graphql(<<~GQL, { id: rid }, idempotent: true)
           mutation($id: String!) { issueRelationDelete(id: $id) { success } }
         GQL
       end
@@ -920,7 +1097,9 @@ module Linear
     # `{ uploadUrl, assetUrl, headers }`. The byte PUT stays in the CLI (local-file I/O), so no
     # GraphQL lives outside this class.
     def request_file_upload(content_type:, filename:, size:)
-      data = graphql(<<~GQL, { contentType: content_type, filename: filename, size: size })
+      # idempotent for retry purposes — a re-issued upload slot mints no user-visible object; the
+      # asset only exists once the CLI PUTs bytes to the URL it hands back.
+      data = graphql(<<~GQL, { contentType: content_type, filename: filename, size: size }, idempotent: true)
         mutation($contentType: String!, $filename: String!, $size: Int!) {
           fileUpload(contentType: $contentType, filename: $filename, size: $size) {
             success
@@ -977,8 +1156,80 @@ module Linear
       limit ? nodes.first(limit) : nodes
     end
 
-    def link_result(kind, ref, issue_node, ok)
-      { kind: kind, ref: ref, identifier: issue_node && issue_node["identifier"], ok: !!ok }
+    def link_result(kind, ref, issue_node, ok, error: nil)
+      { kind: kind, ref: ref, identifier: issue_node && issue_node["identifier"], ok: !!ok, error: error }
+    end
+
+    # --- unknown-outcome recovery: census before you re-send (AGT-280) -------
+
+    # Run a NON-idempotent mutation under the only retry policy that is safe for one: look before you
+    # re-send. `census` is a lambda that returns the object if the write DID land and nil if it
+    # provably did not.
+    #
+    #   * the mutation succeeds        → [value, false]
+    #   * unknown, census finds it     → [found, true]   — the write had committed; adopt it
+    #   * unknown, census says absent  → re-send (a proven absence cannot be duplicated)
+    #   * unknown, census cannot run   → UnknownOutcome; we know nothing, so we change nothing
+    #
+    # Returns [value, recovered].
+    def with_census(label, census)
+      attempt = 0
+      begin
+        attempt += 1
+        [yield, false]
+      rescue UnknownOutcome => e
+        found = run_census(label, census, e)
+        return [found, true] unless found.nil?
+
+        if attempt >= MAX_ATTEMPTS
+          raise UnknownOutcome, "#{e.message} (#{label}: censused #{attempt}×, absent every time, " \
+                                "but the re-send never got an answer either)"
+        end
+
+        debug_log { "#{label}: unknown outcome on attempt #{attempt}; census says absent — safe to re-send" }
+        backoff_pause(exponential_backoff(attempt))
+        retry
+      end
+    end
+
+    # The census is a read, so it gets the ordinary read retry. If it still cannot answer, the
+    # outcome stays UNKNOWN — re-sending on a census we could not run is the duplicate factory this
+    # whole path exists to close.
+    def run_census(label, census, original)
+      census.call
+    rescue Error => e
+      raise UnknownOutcome, "#{original.message} The #{label} census could not run either " \
+                            "(#{e.class}: #{e.message}), so the outcome is still UNKNOWN."
+    end
+
+    # Is this createdAt inside the census window? Unparseable timestamps answer false: a census that
+    # cannot date a candidate must not adopt it.
+    def within_census_window?(created_at, since)
+      Time.parse(created_at.to_s).utc >= since
+    rescue ArgumentError, TypeError
+      false
+    end
+
+    # One dependency link applied at create time, guarded so it can never take the create with it.
+    # Records ok:false plus the reason instead of raising; `error` is what the caller prints and what
+    # tells a retry which steps are still outstanding.
+    def link_step(links, kind, ref)
+      target = nil
+      target = find_issue(ref)
+      return links << link_result(kind, ref, nil, false, error: "#{ref} not found") unless target
+
+      links << link_result(kind, ref, target, yield(target))
+    rescue Error => e
+      links << link_result(kind, ref, target, false, error: brief_error(e))
+    end
+
+    # A link failure is printed inline beside its ref, so it gets the headline rather than the essay
+    # ({UnknownOutcome}'s full text is four sentences of instructions). The whole message still
+    # surfaces when the failure IS the top-level outcome.
+    def brief_error(err)
+      first = err.message.to_s.split(/(?<=\.)\s/).first.to_s.strip
+      first = "#{first[0, 157]}…" if first.length > 158
+      "#{err.class.name.split("::").last}: #{first}"
     end
 
     # Parse an estimate to a plain integer (Linear estimate points), raising InvalidInput on non-numeric
@@ -1030,6 +1281,12 @@ module Linear
 
     # The single HTTP round-trip. Returns the raw Net::HTTPResponse (tests stub this to feed canned
     # 429/usage-limit responses). Kept tiny + Rails-free.
+    # Split into two phases on purpose. `Net::HTTP#request` on an unstarted connection does connect,
+    # write and read in one call, so every transport error came back indistinguishable: "we never
+    # reached Linear" and "Linear has our mutation and we never heard back" arrived as the same
+    # exception, and the retry loop treated both as re-sendable. Starting the connection separately
+    # gives the one seam that separates them — anything raised by `start` is DNS/TCP/TLS and provably
+    # pre-send; anything raised by `request` is at or after the write (AGT-280).
     def perform_request(query, variables)
       http = Net::HTTP.new(ENDPOINT.host, ENDPOINT.port)
       http.use_ssl = true
@@ -1038,7 +1295,46 @@ module Linear
         "Authorization" => @api_key
       })
       req.body = JSON.generate({ query: query, variables: utf8(variables) })
-      http.request(req)
+
+      begin
+        http.start
+      rescue *NETWORK_ERRORS => e
+        raise TransportFailure.new(e, :connect)
+      end
+
+      begin
+        http.request(req)
+      rescue *NETWORK_ERRORS => e
+        raise TransportFailure.new(e, :request)
+      ensure
+        # Closing the socket must never mask the real outcome — the response body is already fully
+        # read by the time #request returns (no block form), so a failure here is pure teardown.
+        begin
+          http.finish if http.started?
+        rescue StandardError
+          nil
+        end
+      end
+    end
+
+    # True when re-sending this document could make a SECOND object. Linear's operations are either
+    # `query …`, the `{ … }` shorthand query, or `mutation …`; anything we cannot positively read as
+    # a query is treated as a mutation, because that is the direction that fails safe.
+    def mutation?(query)
+      body = query.to_s.sub(/\A(?:\s*\#[^\n]*\n)*/, "").lstrip
+      return false if body.start_with?("{")
+
+      !body.match?(/\Aquery\b/)
+    end
+
+    # The one error whose whole job is to stop the caller believing "failed" (AGT-280).
+    def unknown_outcome(cause, attempt)
+      UnknownOutcome.new(
+        "Linear never answered a write that had already been sent (#{cause}) on attempt #{attempt}. " \
+        "The write MAY HAVE COMMITTED — this is UNKNOWN, not failed. It was deliberately NOT " \
+        "re-sent: re-sending a non-idempotent mutation is how duplicates get minted. " \
+        "Census before retrying (see README \"Writes whose outcome is unknown\")."
+      )
     end
 
     def parse_json(str)
