@@ -66,6 +66,14 @@ Run `linear` with no arguments for the full command list.
 4. After any change, **report the returned identifier and URL** back to the user.
 5. If `linear` prints an error, **surface the exact message** — don't guess flags or silently retry a
    different command. A missing key prints a clear `LINEAR_API_KEY not set` hint.
+6. **Read the exit code before retrying a write.** `1` is a refusal — nothing was written, so fixing
+   the input and re-running is safe. `75` is `OUTCOME UNKNOWN`: the request reached Linear and the
+   answer never came back, so the write **may already exist** — census with `search` / `comments` /
+   `view` before doing anything, and never re-run the command blind. `76` is partial: the issue or
+   the state change landed and a follow-up step did not, and stderr names the exact `relate` /
+   `comment` command that finishes it — run that, not the original create (AGT-280).
+   Note a shell pipeline reports its LAST command's status, so `linear create … | tail -3` is always
+   `0`; read `${PIPESTATUS[0]}` or don't pipe.
 
 ## Notes
 
