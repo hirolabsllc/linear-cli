@@ -299,15 +299,42 @@ module Linear
     # All labels visible to the team: workspace-level (shared) + this team's own. Linear's default
     # workspace ships Bug/Feature/Improvement at the workspace level, so a team-only filter misses
     # them — fetch everything and match by name.
-    def labels
-      data = graphql("query { issueLabels { nodes { id name } } }")
-      data.dig("issueLabels", "nodes") || []
+    #
+    # FULLY PAGINATED since AGT-281. This asked for `issueLabels { nodes }` with no `first:`, and
+    # Linear's connection default is 50 — measured 2026-09-05: an unfiltered `issues` connection on a
+    # team holding thousands of rows returned exactly 50 nodes with `hasNextPage: true`. So the 51st
+    # label onward was INVISIBLE, and the caller that matters reads "not in this list" as "does not
+    # exist": past the boundary {#find_or_create_label} would take its create branch and silently mint
+    # a DUPLICATE label, which then splits every label-filtered {#list}. Latent when it was found (16
+    # labels in the workspace, 34 of headroom) and silent at the boundary, which is the same shape as
+    # the truncation {#paginate} exists for — so this walks the connection rather than raising a
+    # `first:` to some larger number that would fail the same way later.
+    #
+    # Memoized per client instance, like {#teams} and {#workflow_states}: {#add_labels} resolves
+    # several names in one call and the walk is no longer one cheap request. The memo is dropped the
+    # moment a label is created, and `refresh: true` bypasses it for {#existing_label_id} — the
+    # AGT-280 census, whose whole question is whether our own timed-out create just landed.
+    def labels(refresh: false)
+      @labels = nil if refresh
+      @labels ||= paginate(label: "issueLabels",
+                           remedy: "some workspace labels are invisible, so a `--label` that exists " \
+                                   "could be created a second time — raise " \
+                                   "Linear::Client::MAX_LIST_PAGES.") do |want, cursor|
+        graphql(<<~GQL, { first: want, after: cursor })["issueLabels"]
+          query($first: Int!, $after: String) {
+            issueLabels(first: $first, after: $after) {
+              nodes { id name }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        GQL
+      end
     end
 
     # Resolve a label name to its id, creating it at the workspace level if missing. Case-insensitive;
     # new labels are Title-cased with a canonical color when known. Returns the label id (or nil).
     def find_or_create_label(name)
-      existing = labels.find { |l| l["name"].downcase == name.downcase }
+      existing = labels.find { |l| l["name"].to_s.casecmp?(name.to_s) }
       return existing["id"] if existing
 
       color = LABEL_COLORS[name.downcase] || "#95a2b3"
@@ -325,14 +352,15 @@ module Linear
         GQL
         data.dig("issueLabelCreate", "issueLabel", "id")
       end
+      @labels = nil if id # the memoized list predates this label
       id
     end
 
     # The id of an existing label named `display`, or nil — the census half of
-    # {#find_or_create_label}. Re-reads the live list rather than trusting the one we already
-    # searched: the whole question is whether our own timed-out create added to it.
+    # {#find_or_create_label}. Forces a FRESH read rather than trusting the list we already searched:
+    # the whole question is whether our own timed-out create added to it.
     def existing_label_id(display)
-      labels.find { |l| l["name"].to_s.casecmp?(display) }&.fetch("id", nil)
+      labels(refresh: true).find { |l| l["name"].to_s.casecmp?(display) }&.fetch("id", nil)
     end
 
     def priority_value(name)

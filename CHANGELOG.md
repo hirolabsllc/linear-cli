@@ -1,5 +1,76 @@
 # Changelog
 
+## [2.18.1] — 2026-09-05
+
+**The label lookup could only ever see Linear's first page, and its caller reads "not in this list"
+as "does not exist" ([AGT-281](https://linear.app/hgl-ai/issue/AGT-281)).**
+
+Found while shipping v2.18.0, which added a census on top of this method and inherited its blind
+spot. `Linear::Client#labels` asked for a connection with no `first:`:
+
+```ruby
+def labels
+  data = graphql("query { issueLabels { nodes { id name } } }")
+  data.dig("issueLabels", "nodes") || []
+end
+```
+
+**Linear's connection default is 50** — measured 2026-09-05, one query against a team holding
+thousands of issues, no `first:`:
+
+```
+no `first:` on a connection with thousands of rows -> 50 nodes, hasNextPage=true
+```
+
+So from the 51st label onward the row was invisible, and `find_or_create_label` — the only caller
+that matters — takes "not on page one" as "does not exist" and creates it:
+
+```
+find_or_create_label("Regression")  →  not on page 1  →  issueLabelCreate  →  a SECOND "Regression"
+```
+
+Nothing warns. The caller sees a successful `--label Regression`, and the workspace quietly grows a
+duplicate that then splits every label-filtered `list`.
+
+**It was latent, not live.** This workspace had 16 labels when the bug was found, and the
+unpaginated call returned all 16 — 34 of headroom:
+
+```
+client #labels (no first:) returned: 16
+true total labels in workspace:      16
+invisible to #labels:                0
+```
+
+That is the whole problem with the boundary: nothing distinguishes "page one is all of them" from
+"page one is fifty of them", and the day it crosses, the failure is a silent write.
+
+It also **capped v2.18.0's own fix**. `existing_label_id` re-reads the label list to decide whether a
+timed-out `issueLabelCreate` landed; past 50, "absent" could mean "page two", and the census would
+re-send — the exact duplicate-minting AGT-280 exists to prevent.
+
+`#labels` now walks the connection through the same `#paginate` that `#list` and `#comments` already
+use, which brings the `MAX_LIST_PAGES` ceiling and its loud TRUNCATED warning with it. Raising a
+bare `first:` was rejected: it fails the same way later, just further out.
+
+Two follow-on details:
+
+* **Memoized per client instance**, like `#teams` and `#workflow_states` — `#add_labels` resolves
+  several names in one call and the walk is no longer one cheap request. The memo is dropped the
+  moment a label is created.
+* **`existing_label_id` forces a fresh read** (`labels(refresh: true)`). Answering the AGT-280 census
+  from a list taken *before* the write would defeat its entire purpose.
+
+Covered by `test/linear/label_pagination_test.rb` (9 tests). Its fake `issueLabels` connection
+honours Linear's real 50-row default when no `first:` is given, so pointed at the pre-fix client
+(v2.18.0, `b1c3e3b`) it reports **6 failures and 0 errors** — headlined by `find_or_create_label`
+reaching `issueLabelCreate` for a label that already exists, i.e. the duplicate actually being
+minted. The other 3 are paired controls that pass on both sides by design. Suite: 293 tests, 1074
+assertions, 0 failures.
+
+Verified against the live API: the walk returns the same 16 labels in 396 ms, the second call is
+memoized (0 ms), `find_or_create_label("bug")` resolves to the existing id without creating, and the
+census answers for a present name and `nil` for an absent one.
+
 ## [2.18.0] — 2026-09-05
 
 **A "failed" write that had committed, and a retry loop that would happily have committed it four
