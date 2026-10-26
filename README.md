@@ -28,7 +28,7 @@ gem build linear_cli.gemspec && gem install ./linear_cli-1.0.0.gem
 # `linear` is now on PATH (wherever RubyGems installs executables)
 ```
 
-Ruby **3.4.9** is pinned via `.ruby-version` (rbenv auto-selects it in the repo dir).
+Ruby **3.4.12** is pinned via `.ruby-version` (rbenv auto-selects it in the repo dir).
 
 ## Configuration (env only)
 
@@ -235,7 +235,7 @@ bundle install
 bundle exec rake test     # Minitest, no network (GraphQL transport is stubbed)
 ```
 
-CI runs the same on Ruby 3.4.9 (`.github/workflows/ci.yml`).
+CI runs the same on Ruby 3.4.12 (`.github/workflows/ci.yml`).
 
 **Never edit your main clone in place** — work in a `git worktree`. Several concurrent agent sessions
 may share one clone, and a caller can be `exec`ing its working tree live (see *Releasing* below), so an
